@@ -5,6 +5,7 @@
 # retrigger5
 # retrigger6
 # retrigger7
+# retrigger8
 """
 scan_changed_files.py — Runs every available method (via inference_utils.py)
 on Python files in a GitHub Actions workflow, and fails the check if the
