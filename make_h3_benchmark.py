@@ -11,7 +11,8 @@ Usage:
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
-N_BENCHMARK_SAMPLES = 30  # small enough to keep CI runs fast
+N_BENCHMARK_SAMPLES = 100  # matches the n=100 used in the local Hybrid.ipynb H3 cell,
+                            # so PC and GitHub Actions results are directly comparable
 
 df = pd.read_csv('dataset_with_content.csv')
 df.columns = df.columns.str.strip().str.lower()
