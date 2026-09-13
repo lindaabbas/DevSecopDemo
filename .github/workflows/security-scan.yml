@@ -38,7 +38,7 @@ jobs:
           GATE_ON: 'Hybrid Ensemble'
           REPORT_ONLY: '0'
 
-        - name: Measure H3 pipeline timing
+      - name: Measure H3 pipeline timing
         if: always()
         run: python measure_h3_pipeline.py
 
