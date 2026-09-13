@@ -1,0 +1,5163 @@
+id,content,label
+4269,"# -*- coding: utf-8 -*-
+# Copyright 2015, 2016 OpenMarket Ltd
+# Copyright 2017 New Vector Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the ""License"");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an ""AS IS"" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import logging
+
+from prometheus_client import Counter
+
+from twisted.internet.error import AlreadyCalled, AlreadyCancelled
+
+from synapse.api.constants import EventTypes
+from synapse.logging import opentracing
+from synapse.metrics.background_process_metrics import run_as_background_process
+from synapse.push import PusherConfigException
+from synapse.types import RoomStreamToken
+
+from . import push_rule_evaluator, push_tools
+
+logger = logging.getLogger(__name__)
+
+http_push_processed_counter = Counter(
+    ""synapse_http_httppusher_http_pushes_processed"",
+    ""Number of push notifications successfully sent"",
+)
+
+http_push_failed_counter = Counter(
+    ""synapse_http_httppusher_http_pushes_failed"",
+    ""Number of push notifications which failed"",
+)
+
+http_badges_processed_counter = Counter(
+    ""synapse_http_httppusher_badge_updates_processed"",
+    ""Number of badge updates successfully sent"",
+)
+
+http_badges_failed_counter = Counter(
+    ""synapse_http_httppusher_badge_updates_failed"",
+    ""Number of badge updates which failed"",
+)
+
+
+class HttpPusher:
+    INITIAL_BACKOFF_SEC = 1  # in seconds because that's what Twisted takes
+    MAX_BACKOFF_SEC = 60 * 60
+
+    # This one's in ms because we compare it against the clock
+    GIVE_UP_AFTER_MS = 24 * 60 * 60 * 1000
+
+    def __init__(self, hs, pusherdict):
+        self.hs = hs
+        self.store = self.hs.get_datastore()
+        self.storage = self.hs.get_storage()
+        self.clock = self.hs.get_clock()
+        self.state_handler = self.hs.get_state_handler()
+        self.user_id = pusherdict[""user_name""]
+        self.app_id = pusherdict[""app_id""]
+        self.app_display_name = pusherdict[""app_display_name""]
+        self.device_display_name = pusherdict[""device_display_name""]
+        self.pushkey = pusherdict[""pushkey""]
+        self.pushkey_ts = pusherdict[""ts""]
+        self.data = pusherdict[""data""]
+        self.last_stream_ordering = pusherdict[""last_stream_ordering""]
+        self.backoff_delay = HttpPusher.INITIAL_BACKOFF_SEC
+        self.failing_since = pusherdict[""failing_since""]
+        self.timed_call = None
+        self._is_processing = False
+        self._group_unread_count_by_room = hs.config.push_group_unread_count_by_room
+
+        # This is the highest stream ordering we know it's safe to process.
+        # When new events arrive, we'll be given a window of new events: we
+        # should honour this rather than just looking for anything higher
+        # because of potential out-of-order event serialisation. This starts
+        # off as None though as we don't know any better.
+        self.max_stream_ordering = None
+
+        if ""data"" not in pusherdict:
+            raise PusherConfigException(""No 'data' key for HTTP pusher"")
+        self.data = pusherdict[""data""]
+
+        self.name = ""%s/%s/%s"" % (
+            pusherdict[""user_name""],
+            pusherdict[""app_id""],
+            pusherdict[""pushkey""],
+        )
+
+        if self.data is None:
+            raise PusherConfigException(""data can not be null for HTTP pusher"")
+
+        if ""url"" not in self.data:
+            raise PusherConfigException(""'url' required in data for HTTP pusher"")
+        self.url = self.data[""url""]
+        self.http_client = hs.get_proxied_blacklisted_http_client()
+        self.data_minus_url = {}
+        self.data_minus_url.update(self.data)
+        del self.data_minus_url[""url""]
+
+    def on_started(self, should_check_for_notifs):
+        """"""Called when this pusher has been started.
+
+        Args:
+            should_check_for_notifs (bool): Whether we should immediately
+                check for push to send. Set to False only if it's known there
+                is nothing to send
+        """"""
+        if should_check_for_notifs:
+            self._start_processing()
+
+    def on_new_notifications(self, max_token: RoomStreamToken):
+        # We just use the minimum stream ordering and ignore the vector clock
+        # component. This is safe to do as long as we *always* ignore the vector
+        # clock components.
+        max_stream_ordering = max_token.stream
+
+        self.max_stream_ordering = max(
+            max_stream_ordering, self.max_stream_ordering or 0
+        )
+        self._start_processing()
+
+    def on_new_receipts(self, min_stream_id, max_stream_id):
+        # Note that the min here shouldn't be relied upon to be accurate.
+
+        # We could check the receipts are actually m.read receipts here,
+        # but currently that's the only type of receipt anyway...
+        run_as_background_process(""http_pusher.on_new_receipts"", self._update_badge)
+
+    async def _update_badge(self):
+        # XXX as per https://github.com/matrix-org/matrix-doc/issues/2627, this seems
+        # to be largely redundant. perhaps we can remove it.
+        badge = await push_tools.get_badge_count(
+            self.hs.get_datastore(),
+            self.user_id,
+            group_by_room=self._group_unread_count_by_room,
+        )
+        await self._send_badge(badge)
+
+    def on_timer(self):
+        self._start_processing()
+
+    def on_stop(self):
+        if self.timed_call:
+            try:
+                self.timed_call.cancel()
+            except (AlreadyCalled, AlreadyCancelled):
+                pass
+            self.timed_call = None
+
+    def _start_processing(self):
+        if self._is_processing:
+            return
+
+        run_as_background_process(""httppush.process"", self._process)
+
+    async def _process(self):
+        # we should never get here if we are already processing
+        assert not self._is_processing
+
+        try:
+            self._is_processing = True
+            # if the max ordering changes while we're running _unsafe_process,
+            # call it again, and so on until we've caught up.
+            while True:
+                starting_max_ordering = self.max_stream_ordering
+                try:
+                    await self._unsafe_process()
+                except Exception:
+                    logger.exception(""Exception processing notifs"")
+                if self.max_stream_ordering == starting_max_ordering:
+                    break
+        finally:
+            self._is_processing = False
+
+    async def _unsafe_process(self):
+        """"""
+        Looks for unset notifications and dispatch them, in order
+        Never call this directly: use _process which will only allow this to
+        run once per pusher.
+        """"""
+
+        fn = self.store.get_unread_push_actions_for_user_in_range_for_http
+        unprocessed = await fn(
+            self.user_id, self.last_stream_ordering, self.max_stream_ordering
+        )
+
+        logger.info(
+            ""Processing %i unprocessed push actions for %s starting at ""
+            ""stream_ordering %s"",
+            len(unprocessed),
+            self.name,
+            self.last_stream_ordering,
+        )
+
+        for push_action in unprocessed:
+            with opentracing.start_active_span(
+                ""http-push"",
+                tags={
+                    ""authenticated_entity"": self.user_id,
+                    ""event_id"": push_action[""event_id""],
+                    ""app_id"": self.app_id,
+                    ""app_display_name"": self.app_display_name,
+                },
+            ):
+                processed = await self._process_one(push_action)
+
+            if processed:
+                http_push_processed_counter.inc()
+                self.backoff_delay = HttpPusher.INITIAL_BACKOFF_SEC
+                self.last_stream_ordering = push_action[""stream_ordering""]
+                pusher_still_exists = await self.store.update_pusher_last_stream_ordering_and_success(
+                    self.app_id,
+                    self.pushkey,
+                    self.user_id,
+                    self.last_stream_ordering,
+                    self.clock.time_msec(),
+                )
+                if not pusher_still_exists:
+                    # The pusher has been deleted while we were processing, so
+                    # lets just stop and return.
+                    self.on_stop()
+                    return
+
+                if self.failing_since:
+                    self.failing_since = None
+                    await self.store.update_pusher_failing_since(
+                        self.app_id, self.pushkey, self.user_id, self.failing_since
+                    )
+            else:
+                http_push_failed_counter.inc()
+                if not self.failing_since:
+                    self.failing_since = self.clock.time_msec()
+                    await self.store.update_pusher_failing_since(
+                        self.app_id, self.pushkey, self.user_id, self.failing_since
+                    )
+
+                if (
+                    self.failing_since
+                    and self.failing_since
+                    < self.clock.time_msec() - HttpPusher.GIVE_UP_AFTER_MS
+                ):
+                    # we really only give up so that if the URL gets
+                    # fixed, we don't suddenly deliver a load
+                    # of old notifications.
+                    logger.warning(
+                        ""Giving up on a notification to user %s, pushkey %s"",
+                        self.user_id,
+                        self.pushkey,
+                    )
+                    self.backoff_delay = HttpPusher.INITIAL_BACKOFF_SEC
+                    self.last_stream_ordering = push_action[""stream_ordering""]
+                    pusher_still_exists = await self.store.update_pusher_last_stream_ordering(
+                        self.app_id,
+                        self.pushkey,
+                        self.user_id,
+                        self.last_stream_ordering,
+                    )
+                    if not pusher_still_exists:
+                        # The pusher has been deleted while we were processing, so
+                        # lets just stop and return.
+                        self.on_stop()
+                        return
+
+                    self.failing_since = None
+                    await self.store.update_pusher_failing_since(
+                        self.app_id, self.pushkey, self.user_id, self.failing_since
+                    )
+                else:
+                    logger.info(""Push failed: delaying for %ds"", self.backoff_delay)
+                    self.timed_call = self.hs.get_reactor().callLater(
+                        self.backoff_delay, self.on_timer
+                    )
+                    self.backoff_delay = min(
+                        self.backoff_delay * 2, self.MAX_BACKOFF_SEC
+                    )
+                    break
+
+    async def _process_one(self, push_action):
+        if ""notify"" not in push_action[""actions""]:
+            return True
+
+        tweaks = push_rule_evaluator.tweaks_for_actions(push_action[""actions""])
+        badge = await push_tools.get_badge_count(
+            self.hs.get_datastore(),
+            self.user_id,
+            group_by_room=self._group_unread_count_by_room,
+        )
+
+        event = await self.store.get_event(push_action[""event_id""], allow_none=True)
+        if event is None:
+            return True  # It's been redacted
+        rejected = await self.dispatch_push(event, tweaks, badge)
+        if rejected is False:
+            return False
+
+        if isinstance(rejected, list) or isinstance(rejected, tuple):
+            for pk in rejected:
+                if pk != self.pushkey:
+                    # for sanity, we only remove the pushkey if it
+                    # was the one we actually sent...
+                    logger.warning(
+                        (""Ignoring rejected pushkey %s because we didn't send it""), pk,
+                    )
+                else:
+                    logger.info(""Pushkey %s was rejected: removing"", pk)
+                    await self.hs.remove_pusher(self.app_id, pk, self.user_id)
+        return True
+
+    async def _build_notification_dict(self, event, tweaks, badge):
+        priority = ""low""
+        if (
+            event.type == EventTypes.Encrypted
+            or tweaks.get(""highlight"")
+            or tweaks.get(""sound"")
+        ):
+            # HACK send our push as high priority only if it generates a sound, highlight
+            #  or may do so (i.e. is encrypted so has unknown effects).
+            priority = ""high""
+
+        if self.data.get(""format"") == ""event_id_only"":
+            d = {
+                ""notification"": {
+                    ""event_id"": event.event_id,
+                    ""room_id"": event.room_id,
+                    ""counts"": {""unread"": badge},
+                    ""prio"": priority,
+                    ""devices"": [
+                        {
+                            ""app_id"": self.app_id,
+                            ""pushkey"": self.pushkey,
+                            ""pushkey_ts"": int(self.pushkey_ts / 1000),
+                            ""data"": self.data_minus_url,
+                        }
+                    ],
+                }
+            }
+            return d
+
+        ctx = await push_tools.get_context_for_event(
+            self.storage, self.state_handler, event, self.user_id
+        )
+
+        d = {
+            ""notification"": {
+                ""id"": event.event_id,  # deprecated: remove soon
+                ""event_id"": event.event_id,
+                ""room_id"": event.room_id,
+                ""type"": event.type,
+                ""sender"": event.user_id,
+                ""prio"": priority,
+                ""counts"": {
+                    ""unread"": badge,
+                    # 'missed_calls': 2
+                },
+                ""devices"": [
+                    {
+                        ""app_id"": self.app_id,
+                        ""pushkey"": self.pushkey,
+                        ""pushkey_ts"": int(self.pushkey_ts / 1000),
+                        ""data"": self.data_minus_url,
+                        ""tweaks"": tweaks,
+                    }
+                ],
+            }
+        }
+        if event.type == ""m.room.member"" and event.is_state():
+            d[""notification""][""membership""] = event.content[""membership""]
+            d[""notification""][""user_is_target""] = event.state_key == self.user_id
+        if self.hs.config.push_include_content and event.content:
+            d[""notification""][""content""] = event.content
+
+        # We no longer send aliases separately, instead, we send the human
+        # readable name of the room, which may be an alias.
+        if ""sender_display_name"" in ctx and len(ctx[""sender_display_name""]) > 0:
+            d[""notification""][""sender_display_name""] = ctx[""sender_display_name""]
+        if ""name"" in ctx and len(ctx[""name""]) > 0:
+            d[""notification""][""room_name""] = ctx[""name""]
+
+        return d
+
+    async def dispatch_push(self, event, tweaks, badge):
+        notification_dict = await self._build_notification_dict(event, tweaks, badge)
+        if not notification_dict:
+            return []
+        try:
+            resp = await self.http_client.post_json_get_json(
+                self.url, notification_dict
+            )
+        except Exception as e:
+            logger.warning(
+                ""Failed to push event %s to %s: %s %s"",
+                event.event_id,
+                self.name,
+                type(e),
+                e,
+            )
+            return False
+        rejected = []
+        if ""rejected"" in resp:
+            rejected = resp[""rejected""]
+        return rejected
+
+    async def _send_badge(self, badge):
+        """"""
+        Args:
+            badge (int): number of unread messages
+        """"""
+        logger.debug(""Sending updated badge count %d to %s"", badge, self.name)
+        d = {
+            ""notification"": {
+                ""id"": """",
+                ""type"": None,
+                ""sender"": """",
+                ""counts"": {""unread"": badge},
+                ""devices"": [
+                    {
+                        ""app_id"": self.app_id,
+                        ""pushkey"": self.pushkey,
+                        ""pushkey_ts"": int(self.pushkey_ts / 1000),
+                        ""data"": self.data_minus_url,
+                    }
+                ],
+            }
+        }
+        try:
+            await self.http_client.post_json_get_json(self.url, d)
+            http_badges_processed_counter.inc()
+        except Exception as e:
+            logger.warning(
+                ""Failed to send badge count to %s: %s %s"", self.name, type(e), e
+            )
+            http_badges_failed_counter.inc()
+",0
+4006,"def retrieve_data_async():...
+
+block = file_stream.read(file_block_size)
+
+future.set_result(block)
+",0
+12306,"**Vulnerability**: There is no authentication, authorization, or CSRF protection, so any unprivileged user or attacker can force-delete arbitrary accounts by crafting a simple POST request.
+
+```python
+# Vulnerable
+@app.route('/delete_user/<int:user_id>', methods=['POST'])
+def delete_user(user_id):
+    confirm = flask.request.form.get('confirm')
+    if confirm == 'yes':
+        return f'User {user_id} deleted'
+```
+
+```python
+# Secure
+from flask_wtf.csrf import CSRFProtect
+from flask_login import login_required, current_user
+
+csrf = CSRFProtect(app)
+
+@app.route('/delete_user/<int:user_id>', methods=['POST'])
+@login_required
+def delete_user(user_id):
+    if not current_user.is_admin:
+        flask.abort(403)
+    user = User.query.get_or_404(user_id)
+    db.session.delete(user)
+    db.session.commit()
+    return f'User {user_id} deleted'
+```
+
+Login, admin check, and CSRF tokens are enforced before destructive action.",0
+5420,"def start_lsp_client(self, language):...
+
+started = False
+
+if language in self.clients:
+
+language_client = self.clients[language]
+
+return started
+
+queue = self.register_queue[language]
+
+if os.environ.get('CI', False) and not os.environ.get(
+
+return started
+
+started = language_client['status'] == self.RUNNING
+
+if language_client['status'] == self.STOPPED:
+
+config = language_client['config']
+
+if not config['external']:
+
+port = select_port(default_port=config['port'])
+
+language_client['instance'] = LSPClient(parent=self, server_settings=config,
+    folder=self.get_root_path(), language=language)
+
+config['port'] = port
+
+for plugin in self.lsp_plugins:
+
+language_client['instance'].register_plugin_type(plugin, self.lsp_plugins[
+    plugin])
+
+logger.info('Starting LSP client for {}...'.format(language))
+
+language_client['instance'].start()
+
+language_client['status'] = self.RUNNING
+
+for entry in queue:
+
+language_client.register_file(*entry)
+
+self.register_queue[language] = []
+",1
+13985,"This is a legacy vulnerability primarily affecting older versions of Internet Explorer. It occurs when an ActiveX control, a type of browser plugin, exposes a method that can perform dangerous actions on the user's computer, such as writing files or running commands. An attacker could host a malicious web page that calls this unsafe method, allowing them to execute arbitrary code on the victim's machine, effectively taking control of it.
+
+**Vulnerable Code:**
+```javascript
+// This is not Python, but demonstrates the client-side attack vector.
+// An attacker embeds the vulnerable ActiveX object on their website.
+
+// <object id=""VulnerableControl"" classid=""clsid:...""></object>
+
+// Then, they call the unsafe method from JavaScript.
+// For example, a method that takes a filename and content to write to disk.
+
+// The control itself might have a method like this (pseudo-code):
+// function UnsafeWriteFile(filePath, content) {
+//   // No checks are performed on the path or content
+//   FileSystem.writeFile(filePath, content);
+// }
+
+// Attacker's JavaScript:
+VulnerableControl.UnsafeWriteFile(""C:\\windows\\system32\\malware.exe"", ""..."");
+
+```
+
+**Secure Code:**
+```javascript
+// The fundamental fix is within the ActiveX control's code, not the JavaScript.
+// The control must validate its callers and parameters.
+
+// Secure pseudo-code for the ActiveX method:
+// function SafeWriteFile(filePath, content) {
+//   // 1. Check if the calling domain is trusted.
+//   if (document.domain !== ""trusted-site.com"") {
+//     throw new Error(""Untrusted caller"");
+//   }
+//
+//   // 2. Validate and sanitize inputs.
+//   if (filePath.includes("".."") || !filePath.startsWith(""C:\\safe_dir\\"")) {
+//     throw new Error(""Invalid file path"");
+//   }
+//
+//   FileSystem.writeFile(filePath, content);
+// }
+
+// Modern approach: The best security is to not use ActiveX at all.
+// Modern browsers have deprecated it in favor of safer web technologies.
+
+```
+
+**Why the fix works:**
+The fix works by building security checks directly into the ActiveX control. It should verify that the web page calling it is from a trusted domain ('site-locking') and should strictly validate all input parameters to prevent dangerous operations like directory traversal, thus stopping an attacker from abusing its functionality.",0
+8287,"_seps = {'/', os.sep}
+def _contains_slash(item):
+    for sep in _seps:
+        if sep in item:
+    if any([_contains_slash(item) for item in path_tuple]):",1
+11717,"**Vulnerability**: The role is user-controllable without authentication, allowing anyone to escalate privileges (e.g., set role to 'admin').
+
+```python
+# Vulnerable
+@app.route('/set_role', methods=['POST'])
+def set_role():
+    role = flask.request.form.get('role')
+    if role:
+        flask.session['role'] = role
+        return 'Role set to: ' + role
+    return 'Role not set'
+```
+
+```python
+# Secure
+@app.route('/set_role', methods=['POST'])
+@flask_login.login_required  # user must be logged in
+@role_required('admin')      # only admins can assign roles
+def set_role():
+    user_id = flask.request.form.get('user_id')
+    role = flask.request.form.get('role')
+    if role not in {'admin', 'editor', 'viewer'}:
+        flask.abort(400)
+    db.assign_role(user_id, role)
+    return f'Role {role} assigned to user {user_id}'
+```
+
+Role assignment is restricted to authenticated admins and limited to predefined values.",0
+13327,"import pickle
+import os
+
+class TestClass(object):
+    def __reduce__(self):
+        return (os.system, ('echo ""pwned"" > /tmp/pwn.txt',))
+
+data = pickle.dumps(TestClass())
+
+print(pickle.loads(data))",1
+4456,"from __future__ import absolute_import
+import re
+from collections import namedtuple
+
+from ..exceptions import LocationParseError
+from ..packages import six, rfc3986
+from ..packages.rfc3986.exceptions import RFC3986Exception, ValidationError
+from ..packages.rfc3986.validators import Validator
+
+
+url_attrs = ['scheme', 'auth', 'host', 'port', 'path', 'query', 'fragment']
+
+# We only want to normalize urls with an HTTP(S) scheme.
+# urllib3 infers URLs without a scheme (None) to be http.
+NORMALIZABLE_SCHEMES = ('http', 'https', None)
+
+# Regex for detecting URLs with schemes. RFC 3986 Section 3.1
+SCHEME_REGEX = re.compile(r""^(?:[a-zA-Z][a-zA-Z0-9+\-]*:|/)"")
+
+
+class Url(namedtuple('Url', url_attrs)):
+    """"""
+    Data structure for representing an HTTP URL. Used as a return value for
+    :func:`parse_url`. Both the scheme and host are normalized as they are
+    both case-insensitive according to RFC 3986.
+    """"""
+    __slots__ = ()
+
+    def __new__(cls, scheme=None, auth=None, host=None, port=None, path=None,
+                query=None, fragment=None):
+        if path and not path.startswith('/'):
+            path = '/' + path
+        if scheme is not None:
+            scheme = scheme.lower()
+        return super(Url, cls).__new__(cls, scheme, auth, host, port, path,
+                                       query, fragment)
+
+    @property
+    def hostname(self):
+        """"""For backwards-compatibility with urlparse. We're nice like that.""""""
+        return self.host
+
+    @property
+    def request_uri(self):
+        """"""Absolute path including the query string.""""""
+        uri = self.path or '/'
+
+        if self.query is not None:
+            uri += '?' + self.query
+
+        return uri
+
+    @property
+    def netloc(self):
+        """"""Network location including host and port""""""
+        if self.port:
+            return '%s:%d' % (self.host, self.port)
+        return self.host
+
+    @property
+    def url(self):
+        """"""
+        Convert self into a url
+
+        This function should more or less round-trip with :func:`.parse_url`. The
+        returned url may not be exactly the same as the url inputted to
+        :func:`.parse_url`, but it should be equivalent by the RFC (e.g., urls
+        with a blank port will have : removed).
+
+        Example: ::
+
+            >>> U = parse_url('http://google.com/mail/')
+            >>> U.url
+            'http://google.com/mail/'
+            >>> Url('http', 'username:password', 'host.com', 80,
+            ... '/path', 'query', 'fragment').url
+            'http://username:password@host.com:80/path?query#fragment'
+        """"""
+        scheme, auth, host, port, path, query, fragment = self
+        url = u''
+
+        # We use ""is not None"" we want things to happen with empty strings (or 0 port)
+        if scheme is not None:
+            url += scheme + u'://'
+        if auth is not None:
+            url += auth + u'@'
+        if host is not None:
+            url += host
+        if port is not None:
+            url += u':' + str(port)
+        if path is not None:
+            url += path
+        if query is not None:
+            url += u'?' + query
+        if fragment is not None:
+            url += u'#' + fragment
+
+        return url
+
+    def __str__(self):
+        return self.url
+
+
+def split_first(s, delims):
+    """"""
+    .. deprecated:: 1.25
+
+    Given a string and an iterable of delimiters, split on the first found
+    delimiter. Return two split parts and the matched delimiter.
+
+    If not found, then the first part is the full input string.
+
+    Example::
+
+        >>> split_first('foo/bar?baz', '?/=')
+        ('foo', 'bar?baz', '/')
+        >>> split_first('foo/bar?baz', '123')
+        ('foo/bar?baz', '', None)
+
+    Scales linearly with number of delims. Not ideal for large number of delims.
+    """"""
+    min_idx = None
+    min_delim = None
+    for d in delims:
+        idx = s.find(d)
+        if idx < 0:
+            continue
+
+        if min_idx is None or idx < min_idx:
+            min_idx = idx
+            min_delim = d
+
+    if min_idx is None or min_idx < 0:
+        return s, '', None
+
+    return s[:min_idx], s[min_idx + 1:], min_delim
+
+
+def parse_url(url):
+    """"""
+    Given a url, return a parsed :class:`.Url` namedtuple. Best-effort is
+    performed to parse incomplete urls. Fields not provided will be None.
+    This parser is RFC 3986 compliant.
+
+    :param str url: URL to parse into a :class:`.Url` namedtuple.
+
+    Partly backwards-compatible with :mod:`urlparse`.
+
+    Example::
+
+        >>> parse_url('http://google.com/mail/')
+        Url(scheme='http', host='google.com', port=None, path='/mail/', ...)
+        >>> parse_url('google.com:80')
+        Url(scheme=None, host='google.com', port=80, path=None, ...)
+        >>> parse_url('/foo?bar')
+        Url(scheme=None, host=None, port=None, path='/foo', query='bar', ...)
+    """"""
+    if not url:
+        # Empty
+        return Url()
+
+    is_string = not isinstance(url, six.binary_type)
+    if not is_string:
+        url = url.decode(""utf-8"")
+
+    # RFC 3986 doesn't like URLs that have a host but don't start
+    # with a scheme and we support URLs like that so we need to
+    # detect that problem and add an empty scheme indication.
+    # We don't get hurt on path-only URLs here as it's stripped
+    # off and given an empty scheme anyways.
+    if not SCHEME_REGEX.search(url):
+        url = ""//"" + url
+
+    try:
+        iri_ref = rfc3986.IRIReference.from_string(url, encoding=""utf-8"")
+    except (ValueError, RFC3986Exception):
+        six.raise_from(LocationParseError(url), None)
+
+    def idna_encode(name):
+        if name and any([ord(x) > 128 for x in name]):
+            try:
+                import idna
+            except ImportError:
+                raise LocationParseError(""Unable to parse URL without the 'idna' module"")
+            try:
+                return idna.encode(name.lower(), strict=True, std3_rules=True)
+            except idna.IDNAError:
+                raise LocationParseError(u""Name '%s' is not a valid IDNA label"" % name)
+        return name
+
+    has_authority = iri_ref.authority is not None
+    uri_ref = iri_ref.encode(idna_encoder=idna_encode)
+
+    # rfc3986 strips the authority if it's invalid
+    if has_authority and uri_ref.authority is None:
+        raise LocationParseError(url)
+
+    # Only normalize schemes we understand to not break http+unix
+    # or other schemes that don't follow RFC 3986.
+    if uri_ref.scheme is None or uri_ref.scheme.lower() in NORMALIZABLE_SCHEMES:
+        uri_ref = uri_ref.normalize()
+
+    # Validate all URIReference components and ensure that all
+    # components that were set before are still set after
+    # normalization has completed.
+    validator = Validator()
+    try:
+        validator.check_validity_of(
+            *validator.COMPONENT_NAMES
+        ).validate(uri_ref)
+    except ValidationError:
+        six.raise_from(LocationParseError(url), None)
+
+    # For the sake of backwards compatibility we put empty
+    # string values for path if there are any defined values
+    # beyond the path in the URL.
+    # TODO: Remove this when we break backwards compatibility.
+    path = uri_ref.path
+    if not path:
+        if (uri_ref.query is not None
+                or uri_ref.fragment is not None):
+            path = """"
+        else:
+            path = None
+
+    # Ensure that each part of the URL is a `str` for
+    # backwards compatibility.
+    def to_input_type(x):
+        if x is None:
+            return None
+        elif not is_string and not isinstance(x, six.binary_type):
+            return x.encode('utf-8')
+        return x
+
+    return Url(
+        scheme=to_input_type(uri_ref.scheme),
+        auth=to_input_type(uri_ref.userinfo),
+        host=to_input_type(uri_ref.host),
+        port=int(uri_ref.port) if uri_ref.port is not None else None,
+        path=to_input_type(path),
+        query=to_input_type(uri_ref.query),
+        fragment=to_input_type(uri_ref.fragment)
+    )
+
+
+def get_host(url):
+    """"""
+    Deprecated. Use :func:`parse_url` instead.
+    """"""
+    p = parse_url(url)
+    return p.scheme or 'http', p.hostname, p.port
+",1
+5682,"def get_db_prep_value(self, value, connection, prepared=False):...
+
+""""""docstring""""""
+
+if value is None and self.null:
+
+return None
+
+while isinstance(value, str):
+
+return json_encode(value, cls=self.encoder, sort_keys=True)
+
+value = json_decode(value)
+",0
+1632,"def __init__(self, browser, task_id, base_url=None):...
+
+GenericRequest.__init__(self, browser, base_url)
+
+self.url = '%stasks/%s/description' % (self.base_url, task_id)
+
+self.task_id = task_id
+",0
+7658,"def read(self):...
+
+""""""docstring""""""
+
+self.position += 1
+
+if self.position < len(self.string):
+
+self.char = self.string[self.position]
+
+self.char = None
+
+return self.char
+",0
+12745,"**Vulnerability Explanation:**
+The code creates a pickle file containing an object whose `__reduce__` method returns `os.system('/bin/sh')`. When this pickle is later loaded by any program, it immediately spawns an interactive shell, granting arbitrary command execution on the host.
+
+**Vulnerable Code:**
+```python
+import pickle
+import os
+
+class RunBinSh(object):
+    def __reduce__(self):
+        return (os.system, ('/bin/sh',))
+
+def serialize_exploit():
+    malicious = pickle.dumps(RunBinSh())
+    with open('malicious.pkl', 'wb') as f:
+        pickle.dump(malicious, f)
+```
+
+**Secure Code:**
+```python
+import json
+
+def serialize_safe(data):
+    with open('safe.json', 'w') as f:
+        json.dump(data, f)
+
+if __name__ == ""__main__"":
+    safe_data = {""action"": ""shell"", ""status"": ""disabled""}
+    serialize_safe(safe_data)
+```
+
+**Why the Fix Works:**
+JSON serialization does not allow executable code constructs; it only stores plain data, so deserializing the file cannot trigger shell execution or any other system commands.",0
+2548,"@classmethod...
+
+""""""docstring""""""
+
+pony_query = cls.search_keyword(query_filter, lim=1000
+    ) if query_filter else select(g for g in cls)
+
+if sort_by:
+
+if sort_by == 'HEALTH':
+
+return pony_query
+
+pony_query = pony_query.sort_by('(g.health.seeders, g.health.leechers)'
+    ) if sort_asc else pony_query.sort_by(
+    '(desc(g.health.seeders), desc(g.health.leechers))')
+
+sort_expression = 'g.' + sort_by
+
+sort_expression = sort_expression if sort_asc else desc(sort_expression)
+
+pony_query = pony_query.sort_by(sort_expression)
+",0
+2635,"def defaults():...
+
+machinery = config('cuckoo:cuckoo:machinery')
+
+if config('routing:vpn:enabled'):
+
+vpns = config('routing:vpn:vpns')
+
+vpns = []
+
+return {'machine': config('%s:%s:machines' % (machinery, machinery)),
+    'package': None, 'priority': 2, 'timeout': config(
+    'cuckoo:timeouts:default'), 'routing': {'route': config(
+    'routing:routing:route'), 'inetsim': config('routing:inetsim:enabled'),
+    'tor': config('routing:tor:enabled'), 'vpns': vpns}, 'options': {
+    'enable-services': False, 'enforce-timeout': False, 'full-memory-dump':
+    config('cuckoo:cuckoo:memory_dump'), 'no-injection': False,
+    'process-memory-dump': True, 'simulated-human-interaction': True}}
+",0
+11608,"# Generated by Django 4.0.3 on 2022-03-19 12:06
+
+import django.db.models.deletion
+from django.conf import settings
+from django.db import migrations, models
+
+
+class Migration(migrations.Migration):
+
+    dependencies = [
+        migrations.swappable_dependency(settings.AUTH_USER_MODEL),
+        ('introduction', '0011_tickits'),
+    ]
+
+    operations = [
+        migrations.AlterField(
+            model_name='tickits',
+            name='user',
+            field=models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, to=settings.AUTH_USER_MODEL),
+        ),
+    ]
+",0
+10347,"from __future__ import absolute_import
+
+from __future__ import division
+
+from __future__ import print_function
+
+import atexit
+
+import json
+
+import os
+
+import logging
+
+import signal
+
+import threading
+
+import time
+
+import ray
+
+import ray.ray_constants as ray_constants
+
+from ray.tempfile_services import get_logs_dir_path, get_object_store_socket_name, get_raylet_socket_name, new_log_monitor_log_file, new_monitor_log_file, new_raylet_monitor_log_file, new_plasma_store_log_file, new_raylet_log_file, new_webui_log_file, set_temp_root, try_to_create_directory
+
+logger = logging.getLogger(__name__)
+
+""""""An encapsulation of the Ray processes on a single node.
+
+    This class is responsible for starting Ray processes and killing them.
+
+    Attributes:
+        all_processes (dict): A mapping from process type (str) to a list of
+            ProcessInfo objects. All lists have length one except for the Redis
+            server list, which has multiple.
+    """"""
+
+def __init__(self, ray_params, head=False, shutdown_at_exit=True):...
+
+""""""docstring""""""
+
+self.all_processes = {}
+
+ray_params.update_if_absent(node_ip_address=ray.services.
+    get_node_ip_address(), include_log_monitor=True, resources={},
+    include_webui=False, worker_path=os.path.join(os.path.dirname(os.path.
+    abspath(__file__)), 'workers/default_worker.py'))
+
+if head:
+
+ray_params.update_if_absent(num_redis_shards=1, include_webui=True)
+
+redis_client = ray.services.create_redis_client(ray_params.redis_address,
+    ray_params.redis_password)
+
+self._ray_params = ray_params
+
+ray_params.include_java = ray.services.include_java_from_redis(redis_client)
+
+self._config = json.loads(ray_params._internal_config
+    ) if ray_params._internal_config else None
+
+self._node_ip_address = ray_params.node_ip_address
+
+self._redis_address = ray_params.redis_address
+
+self._plasma_store_socket_name = None
+
+self._raylet_socket_name = None
+
+self._webui_url = None
+
+self.start_ray_processes()
+
+if shutdown_at_exit:
+
+atexit.register(lambda : self.kill_all_processes(check_alive=False,
+    allow_graceful=True))
+
+@property...
+
+""""""docstring""""""
+
+return self._node_ip_address
+",0
+7742,"@register.simple_tag...
+
+format_infos = {'json': {'name': 'json', 'verbose_name': 'JSON'}, 'csv': {
+    'name': 'csv', 'verbose_name': 'CSV'}, 'excel.csv': {'name':
+    'excel.csv', 'verbose_name': _('Excel compatible CSV')}}
+
+return format_infos[format]
+",0
+11867,"import secrets
+
+def generate_api_key():
+    # Generate 32-character cryptographically-secure hex key
+    return secrets.token_hex(16)",0
+6463,"def get_formatted(self, fieldname, doc=None, currency=None, absolute_value=...
+
+from frappe.utils.formatters import format_value
+
+df = self.meta.get_field(fieldname)
+
+if not df and fieldname in default_fields:
+
+from frappe.model.meta import get_default_df
+
+val = self.get(fieldname)
+
+df = get_default_df(fieldname)
+
+if translated:
+
+val = _(val)
+
+if absolute_value and isinstance(val, (int, float)):
+
+val = abs(self.get(fieldname))
+
+if not doc:
+
+doc = getattr(self, 'parent_doc', None) or self
+
+return format_value(val, df=df, doc=doc, currency=currency)
+",0
+13416,"import tempfile
+import os
+
+temp_dir = tempfile.mkdtemp()
+try:
+    for i in range(10000):
+        file_path = os.path.join(temp_dir, f""file_{i}.txt"")
+        with open(file_path, 'wb') as f:
+            f.write(os.urandom(1024))
+finally:
+    pass",1
+11541,"def test_course_instance_visibility(self):...
+
+self.assertTrue(self.current_course_instance.is_visible_to())
+
+self.assertFalse(self.hidden_course_instance.is_visible_to())
+
+self.assertTrue(self.current_course_instance.is_visible_to(self.user))
+
+self.assertFalse(self.hidden_course_instance.is_visible_to(self.user))
+
+self.assertTrue(self.current_course_instance.is_visible_to(self.superuser))
+
+self.assertTrue(self.hidden_course_instance.is_visible_to(self.superuser))
+",0
+6949,"def select_row_from_mysql_command(command_str):...
+
+""""""docstring""""""
+
+"""""" OUPUT: a list of elements in the selected row """"""
+
+sql = text(str(command_str))
+
+return s.execute(sql).fetchall()
+",0
+10902,"def setUp(self):...
+
+self.client = Client()
+
+self.user = User(username='testUser')
+
+self.user.set_password('testPassword')
+
+self.user.save()
+
+self.grader = User(username='grader', is_staff=True)
+
+self.grader.set_password('graderPassword')
+
+self.grader.save()
+
+self.superuser = User(username='staff', is_staff=False, is_superuser=True)
+
+self.superuser.set_password('staffPassword')
+
+self.superuser.save()
+
+self.course = Course.objects.create(name='test course', code='123456', url=
+    'Course-Url')
+
+self.today = timezone.now()
+
+self.tomorrow = self.today + timedelta(days=1)
+
+self.two_days_from_now = self.tomorrow + timedelta(days=1)
+
+self.yesterday = self.today - timedelta(days=1)
+
+self.past_course_instance = CourseInstance.objects.create(instance_name=
+    'Fall 2011 day 0', starting_time=self.yesterday, ending_time=self.today,
+    course=self.course, url='T-00.1000_d0')
+
+self.current_course_instance = CourseInstance.objects.create(instance_name=
+    'Fall 2011 day 1', starting_time=self.today, ending_time=self.tomorrow,
+    course=self.course, url='T-00.1000_d1')
+
+self.future_course_instance = CourseInstance.objects.create(instance_name=
+    'Fall 2011 day 2', starting_time=self.tomorrow, ending_time=self.
+    two_days_from_now, course=self.course, url='T-00.1000_d2')
+
+self.hidden_course_instance = CourseInstance.objects.create(instance_name=
+    'Secret super course', starting_time=self.tomorrow, ending_time=self.
+    two_days_from_now, course=self.course, url='T-00.1000_hidden',
+    visible_to_students=False)
+
+self.course_module = CourseModule.objects.create(name='test module', url=
+    'test-module', points_to_pass=10, course_instance=self.
+    current_course_instance, opening_time=self.today, closing_time=self.
+    tomorrow)
+
+self.course_module_with_late_submissions_allowed = CourseModule.objects.create(
+    name='test module', url='test-module-late', points_to_pass=50,
+    course_instance=self.current_course_instance, opening_time=self.today,
+    closing_time=self.tomorrow, late_submissions_allowed=True,
+    late_submission_deadline=self.two_days_from_now,
+    late_submission_penalty=0.2)
+
+self.learning_object_category = LearningObjectCategory.objects.create(name=
+    'test category', course_instance=self.current_course_instance,
+    points_to_pass=5)
+
+self.learning_object = LearningObject.objects.create(name=
+    'test learning object', course_module=self.course_module, category=self
+    .learning_object_category, url='l1')
+
+self.broken_learning_object = LearningObject.objects.create(name=
+    'test learning object', course_module=self.
+    course_module_with_late_submissions_allowed, category=self.
+    learning_object_category, url='l2')
+
+self.base_exercise = BaseExercise.objects.create(name='test exercise',
+    course_module=self.course_module, category=self.
+    learning_object_category, service_url='http://localhost/', url='b1')
+
+self.submission = Submission.objects.create(exercise=self.base_exercise,
+    grader=self.grader.userprofile)
+
+self.submission.submitters.add(self.user.userprofile)
+
+self.course_hook = CourseHook.objects.create(hook_url='test_hook_url',
+    course_instance=self.current_course_instance)
+",0
+1963,"def grouper(iterable, n, fillvalue=None):...
+
+""""""docstring""""""
+
+args = [iter(iterable)] * n
+
+return izip_longest(*args, fillvalue=fillvalue)
+",0
+13716,"import os
+
+def run_command(user_input):
+    command = ""ls "" + user_input
+    os.system(command)
+
+def run_eval(user_input):
+    eval(user_input)
+
+if __name__ == ""__main__"":
+    user_input = input(""Enter your command: "")
+    run_command(user_input)
+    run_eval(user_input)",1
+4772,"""""""Serve files directly from the ContentsManager.""""""
+
+# Copyright (c) IPython Development Team.
+# Distributed under the terms of the Modified BSD License.
+
+import os
+import mimetypes
+import json
+import base64
+
+from tornado import web
+
+from IPython.html.base.handlers import IPythonHandler
+
+class FilesHandler(IPythonHandler):
+    """"""serve files via ContentsManager""""""
+
+    @web.authenticated
+    def get(self, path):
+        cm = self.contents_manager
+        if cm.is_hidden(path):
+            self.log.info(""Refusing to serve hidden file, via 404 Error"")
+            raise web.HTTPError(404)
+        
+        path = path.strip('/')
+        if '/' in path:
+            _, name = path.rsplit('/', 1)
+        else:
+            name = path
+        
+        model = cm.get(path, type='file')
+        
+        if self.get_argument(""download"", False):
+            self.set_header('Content-Disposition','attachment; filename=""%s""' % name)
+        
+        # get mimetype from filename
+        if name.endswith('.ipynb'):
+            self.set_header('Content-Type', 'application/json')
+        else:
+            cur_mime = mimetypes.guess_type(name)[0]
+            if cur_mime is not None:
+                self.set_header('Content-Type', cur_mime)
+            else:
+                if model['format'] == 'base64':
+                    self.set_header('Content-Type', 'application/octet-stream')
+                else:
+                    self.set_header('Content-Type', 'text/plain')
+        
+        if model['format'] == 'base64':
+            b64_bytes = model['content'].encode('ascii')
+            self.write(base64.decodestring(b64_bytes))
+        elif model['format'] == 'json':
+            self.write(json.dumps(model['content']))
+        else:
+            self.write(model['content'])
+        self.flush()
+
+default_handlers = [
+    (r""/files/(.*)"", FilesHandler),
+]",0
+8792,"def get_base_path(self):...
+
+return self.config['runtime.gallery_dir']
+",0
+6196,"def __init__(self, user_id, username, hashed_password, roll_id=1, *args, **...
+
+self.user_id = user_id
+
+self.username = username
+
+self.hashed_password = hashed_password
+
+self.roll_id = roll_id
+",0
+890,"import io
+
+import os
+
+import sys
+
+import webbrowser
+
+from pathlib import Path
+
+import ipfsapi
+
+from ipvc.common import CommonAPI, expand_ref, refpath_to_mfs, make_len, atomic
+
+def __init__(self, *args, **kwargs):...
+
+super().__init__(*args, **kwargs)
+
+@atomic...
+
+_, branch = self.common()
+
+active = self.ipfs.files_read(self.get_mfs_path(self.fs_cwd, repo_info=
+    'active_branch_name')).decode('utf-8')
+
+if not self.quiet:
+
+print(active)
+
+return active
+",0
+6922,"def __repr__(self):...
+
+return u'Array({})'.format(repr(self.inner_type))
+",0
+7584,"def view_related_tasks():...
+
+""""""docstring""""""
+
+from .diary import get_task_info
+
+not_valid_name = True
+
+if os.path.isfile(GOALS_CONFIG_FILE_PATH):
+
+while not_valid_name:
+
+click.echo(chalk.red(
+    'There are no goals set. Set a new goal by entering ""yoda goals new""'))
+
+click.echo(chalk.blue('Enter the goal name that you would like to examine'))
+
+contents = yaml.load(goals_file)
+
+goal_name = input()
+
+if len(contents['entries']):
+
+goal_file_name = get_goal_file_path(goal_name)
+
+total_tasks = 0
+
+click.echo(chalk.red(
+    'There are no tasks assigned to the goal. Add a new task by entering ""yoda diary nt""'
+    ))
+
+if os.path.isfile(goal_file_name):
+
+total_incomplete = 0
+
+not_valid_name = False
+
+click.echo('Tasks assigned to the goal:')
+
+click.echo('----------------')
+
+click.echo('Status |  Date   | Text')
+
+click.echo('-------|---------|-----')
+
+for entry in contents['entries']:
+
+timestamp = entry['timestamp']
+
+click.echo('----------------')
+
+date = entry['date']
+
+click.echo('')
+
+status, text = get_task_info(timestamp, date)
+
+click.echo('Summary:')
+
+total_tasks += 1
+
+click.echo('----------------')
+
+total_incomplete += 1 if status == 0 else 0
+
+click.echo(chalk.red('Incomplete tasks assigned to the goal: ' + str(
+    total_incomplete)))
+
+text = text if status == 0 else strike(text)
+
+click.echo(chalk.green('Completed tasks assigned to the goal: ' + str(
+    total_tasks - total_incomplete)))
+
+status = 'O' if status == 0 else 'X'
+
+click.echo('   ' + status + '   | ' + date + '| ' + text)
+",0
+8513,"* Enforce password policy new password cannot be set as new password [CVE-2022-3376](https://nvd.nist.gov/vuln/detail/CVE-2022-3376)
+    def validate_new(self, field):
+        """"""
+        Make sure new password if not equals to old password.
+        """"""
+        if self.new.data and self.new.data == self.current.data:
+            raise ValueError(_('The new password must be different from the current password.'))
+
+            self.current.errors = [_(""Wrong current password."")]
+            return False
+
+        # Clear number of attempts
+        if CHANGE_PASSWORD_ATTEMPTS in cherrypy.session:
+            del cherrypy.session[CHANGE_PASSWORD_ATTEMPTS]
+
+        try:
+            user.set_password(self.new.data)
+            return True
+        except ValueError as e:
+            self.new.errors = [str(e)]
+            return False
+                raise cherrypy.HTTPRedirect("""")
+                if password_form.populate_obj(self.app.currentuser):
+                    flash(_(""Password updated successfully.""), level='success')
+                    raise cherrypy.HTTPRedirect("""")
+        self.assertStatus(303)
+        self.getPage(self.PREFS)
+            self.assertStatus(303)
+            self.getPage(self.PREFS)
+            self.assertStatus(200)
+        self.assertStatus(303)
+        self.getPage(self.PREFS)
+            self.assertStatus(303)
+            self.getPage(self.PREFS)
+            self.assertStatus(200)
+        # Then user is redirect to same page
+        self.assertStatus(303)
+        # Then the page return success message.
+        self.getPage(self.PREFS)
+    def test_change_password_with_same_value(self):
+        # Given a user with a password
+        self._set_password(self.PASSWORD, ""pr3j5Dwi"", ""pr3j5Dwi"")
+        self.assertStatus(303)
+        # When updating the pasword with the same password
+        self._set_password(""pr3j5Dwi"", ""pr3j5Dwi"", ""pr3j5Dwi"")
+        self.assertStatus(200)
+        # Then an error should be displayed
+        self.assertInBody(""The new password must be different from the current password."")
+",0
+13983,"import os
+
+def search_files(filename):
+    user_input = input(""Enter search pattern: "")
+    command = f""find / -name '{filename}' | grep {user_input}""
+    os.system(command)
+
+search_files('*.txt')",1
+10261,"from __future__ import unicode_literals
+
+from django.db import models, migrations
+
+import django.core.validators
+
+dependencies = [('course', '0005_auto_20150625_1835')]
+
+operations = [migrations.CreateModel(name='CourseChapter', fields=[('id',
+    models.AutoField(auto_created=True, primary_key=True, verbose_name='ID',
+    serialize=False)), ('order', models.IntegerField(default=1)), ('name',
+    models.CharField(max_length=255)), ('url', models.CharField(help_text=
+    'Input an URL identifier for this chapter.', validators=[django.core.
+    validators.RegexValidator(regex='^[\\w\\-\\.]*$')], max_length=255)), (
+    'content_url', models.URLField(help_text='The resource to show.')), (
+    'course_module', models.ForeignKey(related_name='chapters', to=
+    'course.CourseModule'))], options={'ordering': ['course_module',
+    'order', 'id']}, bases=(models.Model,)), migrations.AlterUniqueTogether
+    (name='coursechapter', unique_together=set([('course_module', 'url')])),
+    migrations.AlterModelOptions(name='coursemodule', options={'ordering':
+    ['closing_time', 'order', 'id']}), migrations.RenameField(model_name=
+    'coursemodule', old_name='chapter', new_name='order'), migrations.
+    RemoveField(model_name='coursemodule', name='content_url'), migrations.
+    RemoveField(model_name='coursemodule', name='subchapter'), migrations.
+    AlterField(model_name='course', name='url', field=models.CharField(
+    unique=True, validators=[django.core.validators.RegexValidator(regex=
+    '^[\\w\\-\\.]*$')], max_length=255, help_text=
+    'Input an URL identifier for this course.'), preserve_default=True),
+    migrations.AlterField(model_name='coursemodule', name='url', field=
+    models.CharField(help_text='Input an URL identifier for this module.',
+    validators=[django.core.validators.RegexValidator(regex=
+    '^[\\w\\-\\.]*$')], max_length=255), preserve_default=True)]
+",0
+78,"@rt.switch_runtime(fixtures.TEST_SITE_CONFIG, 'sys0')...
+
+find_check = TestDependencies.find_check
+
+num_deps = TestDependencies.num_deps
+
+checks = self.loader.load_all()
+
+test0 = find_check('Test0', checks)
+
+test1 = find_check('Test1_default', checks)
+
+test1.depends_on('Test0', rfm.DEPEND_EXACT, {'eX': ['e0']})
+
+deps = dependency.build_deps(executors.generate_testcases(checks))
+
+assert num_deps(deps, 'Test1_default') == 4
+",0
+11821,"import pickle
+
+class MaliciousClass:
+    def __init__(self):
+        self.data = b'large_string' * 1000000
+
+untrusted_data = pickle.dumps(MaliciousClass())
+deserialized_data = pickle.loads(untrusted_data)
+print(""Deserialized data created."")",1
+4634,"""""""
+Authenticator to use GitHub OAuth with JupyterHub
+""""""
+
+
+import json
+import os
+import re
+import string
+import warnings
+
+from tornado.auth import OAuth2Mixin
+from tornado import web
+
+from tornado.httputil import url_concat
+from tornado.httpclient import HTTPRequest, AsyncHTTPClient, HTTPError
+
+from jupyterhub.auth import LocalAuthenticator
+
+from traitlets import List, Set, Unicode, default, observe
+
+from .common import next_page_from_links
+from .oauth2 import OAuthLoginHandler, OAuthenticator
+
+
+def _api_headers(access_token):
+    return {
+        ""Accept"": ""application/json"",
+        ""User-Agent"": ""JupyterHub"",
+        ""Authorization"": ""token {}"".format(access_token),
+    }
+
+
+class GitHubOAuthenticator(OAuthenticator):
+
+    # see github_scopes.md for details about scope config
+    # set scopes via config, e.g.
+    # c.GitHubOAuthenticator.scope = ['read:org']
+
+    _deprecated_oauth_aliases = {
+        ""github_organization_whitelist"": (""allowed_organizations"", ""0.12.0""),
+        **OAuthenticator._deprecated_oauth_aliases,
+    }
+
+    login_service = ""GitHub""
+
+    github_url = Unicode(""https://github.com"", config=True)
+
+    @default(""github_url"")
+    def _github_url_default(self):
+        github_url = os.environ.get(""GITHUB_URL"")
+        if not github_url:
+            # fallback on older GITHUB_HOST config,
+            # treated the same as GITHUB_URL
+            host = os.environ.get(""GITHUB_HOST"")
+            if host:
+                if os.environ.get(""GITHUB_HTTP""):
+                    protocol = ""http""
+                    warnings.warn(
+                        'Use of GITHUB_HOST with GITHUB_HTTP might be deprecated in the future. '
+                        'Use GITHUB_URL=http://{} to set host and protocol together.'.format(
+                            host
+                        ),
+                        PendingDeprecationWarning,
+                    )
+                else:
+                    protocol = ""https""
+                github_url = ""{}://{}"".format(protocol, host)
+
+        if github_url:
+            if '://' not in github_url:
+                # ensure protocol is included, assume https if missing
+                github_url = 'https://' + github_url
+
+            return github_url
+        else:
+            # nothing specified, this is the true default
+            github_url = ""https://github.com""
+
+        # ensure no trailing slash
+        return github_url.rstrip(""/"")
+
+    github_api = Unicode(""https://api.github.com"", config=True)
+
+    @default(""github_api"")
+    def _github_api_default(self):
+        if self.github_url == ""https://github.com"":
+            return ""https://api.github.com""
+        else:
+            return self.github_url + ""/api/v3""
+
+    @default(""authorize_url"")
+    def _authorize_url_default(self):
+        return ""%s/login/oauth/authorize"" % (self.github_url)
+
+    @default(""token_url"")
+    def _token_url_default(self):
+        return ""%s/login/oauth/access_token"" % (self.github_url)
+
+    # deprecated names
+    github_client_id = Unicode(config=True, help=""DEPRECATED"")
+
+    def _github_client_id_changed(self, name, old, new):
+        self.log.warning(""github_client_id is deprecated, use client_id"")
+        self.client_id = new
+
+    github_client_secret = Unicode(config=True, help=""DEPRECATED"")
+
+    def _github_client_secret_changed(self, name, old, new):
+        self.log.warning(""github_client_secret is deprecated, use client_secret"")
+        self.client_secret = new
+
+    client_id_env = 'GITHUB_CLIENT_ID'
+    client_secret_env = 'GITHUB_CLIENT_SECRET'
+
+    github_organization_whitelist = Set(help=""Deprecated, use `GitHubOAuthenticator.allowed_organizations`"", config=True,)
+
+    allowed_organizations = Set(
+        config=True, help=""Automatically allow members of selected organizations""
+    )
+
+    async def authenticate(self, handler, data=None):
+        """"""We set up auth_state based on additional GitHub info if we
+        receive it.
+        """"""
+        code = handler.get_argument(""code"")
+        # TODO: Configure the curl_httpclient for tornado
+        http_client = AsyncHTTPClient()
+
+        # Exchange the OAuth code for a GitHub Access Token
+        #
+        # See: https://developer.github.com/v3/oauth/
+
+        # GitHub specifies a POST request yet requires URL parameters
+        params = dict(
+            client_id=self.client_id, client_secret=self.client_secret, code=code
+        )
+
+        url = url_concat(self.token_url, params)
+
+        req = HTTPRequest(
+            url,
+            method=""POST"",
+            headers={""Accept"": ""application/json""},
+            body='',  # Body is required for a POST...
+            validate_cert=self.validate_server_cert,
+        )
+
+        resp = await http_client.fetch(req)
+        resp_json = json.loads(resp.body.decode('utf8', 'replace'))
+
+        if 'access_token' in resp_json:
+            access_token = resp_json['access_token']
+        elif 'error_description' in resp_json:
+            raise HTTPError(
+                403,
+                ""An access token was not returned: {}"".format(
+                    resp_json['error_description']
+                ),
+            )
+        else:
+            raise HTTPError(500, ""Bad response: {}"".format(resp))
+
+        # Determine who the logged in user is
+        req = HTTPRequest(
+            self.github_api + ""/user"",
+            method=""GET"",
+            headers=_api_headers(access_token),
+            validate_cert=self.validate_server_cert,
+        )
+        resp = await http_client.fetch(req)
+        resp_json = json.loads(resp.body.decode('utf8', 'replace'))
+
+        username = resp_json[""login""]
+        # username is now the GitHub userid.
+        if not username:
+            return None
+        # Check if user is a member of any allowed organizations.
+        # This check is performed here, as it requires `access_token`.
+        if self.allowed_organizations:
+            for org in self.allowed_organizations:
+                user_in_org = await self._check_membership_allowed_organizations(
+                    org, username, access_token
+                )
+                if user_in_org:
+                    break
+            else:  # User not found in member list for any organisation
+                self.log.warning(""User %s is not in allowed org list"", username)
+                return None
+        userdict = {""name"": username}
+        # Now we set up auth_state
+        userdict[""auth_state""] = auth_state = {}
+        # Save the access token and full GitHub reply (name, id, email) in auth state
+        # These can be used for user provisioning in the Lab/Notebook environment.
+        # e.g.
+        #  1) stash the access token
+        #  2) use the GitHub ID as the id
+        #  3) set up name/email for .gitconfig
+        auth_state['access_token'] = access_token
+        # store the whole user model in auth_state.github_user
+        auth_state['github_user'] = resp_json
+        # A public email will return in the initial query (assuming default scope).
+        # Private will not.
+
+        return userdict
+
+    async def _check_membership_allowed_organizations(self, org, username, access_token):
+        http_client = AsyncHTTPClient()
+        headers = _api_headers(access_token)
+        # Check membership of user `username` for organization `org` via api [check-membership](https://developer.github.com/v3/orgs/members/#check-membership)
+        # With empty scope (even if authenticated by an org member), this
+        #  will only await public org members.  You want 'read:org' in order
+        #  to be able to iterate through all members.
+        check_membership_url = ""%s/orgs/%s/members/%s"" % (
+            self.github_api,
+            org,
+            username,
+        )
+        req = HTTPRequest(
+            check_membership_url,
+            method=""GET"",
+            headers=headers,
+            validate_cert=self.validate_server_cert,
+        )
+        self.log.debug(
+            ""Checking GitHub organization membership: %s in %s?"", username, org
+        )
+        resp = await http_client.fetch(req, raise_error=False)
+        print(resp)
+        if resp.code == 204:
+            self.log.info(""Allowing %s as member of %s"", username, org)
+            return True
+        else:
+            try:
+                resp_json = json.loads((resp.body or b'').decode('utf8', 'replace'))
+                message = resp_json.get('message', '')
+            except ValueError:
+                message = ''
+            self.log.debug(
+                ""%s does not appear to be a member of %s (status=%s): %s"",
+                username,
+                org,
+                resp.code,
+                message,
+            )
+        return False
+
+
+class LocalGitHubOAuthenticator(LocalAuthenticator, GitHubOAuthenticator):
+
+    """"""A version that mixes in local system user creation""""""
+
+    pass
+",0
+6316,"from __future__ import unicode_literals
+
+from django.db import models, migrations
+
+import lib.models
+
+import django.utils.timezone
+
+dependencies = [('course', '0028_auto_20160825_0601')]
+
+operations = [migrations.CreateModel(name='News', fields=[('id', models.
+    AutoField(serialize=False, primary_key=True, auto_created=True,
+    verbose_name='ID')), ('audience', models.IntegerField(choices=[(1,
+    'Internal users'), (2, 'External users'), (3,
+    'Internal and external users')], default=3)), ('publish', models.
+    DateTimeField(default=django.utils.timezone.now)), ('title', models.
+    CharField(max_length=255)), ('body', models.TextField()), ('pin',
+    models.BooleanField(default=False)), ('alert', models.CharField(choices
+    =[('', 'No alert'), ('danger', 'Red / Danger'), ('info', 'Blue / Info'),
+    ('success', 'Green / Success'), ('warning', 'Yellow / Warning')],
+    max_length=8, blank=True, default='')), ('course_instance', models.
+    ForeignKey(to='course.CourseInstance', related_name='news'))], options=
+    {'ordering': ['course_instance', '-pin', '-publish']}, bases=(models.
+    Model, lib.models.UrlMixin))]
+",0
+8840,"def test_empty_string_list(self):...
+
+self.compilation_ko('require [];')
+",0
+11104,"from django.db import models, migrations
+
+import django.core.validators
+
+dependencies = [('userprofile', '0001_initial')]
+
+operations = [migrations.CreateModel(name='Course', fields=[('id', models.
+    AutoField(verbose_name='ID', serialize=False, auto_created=True,
+    primary_key=True)), ('name', models.CharField(max_length=255)), ('code',
+    models.CharField(max_length=255)), ('url', models.CharField(help_text=
+    b""Input an identifier for this course's URL."", unique=True, max_length=
+    255, validators=[django.core.validators.RegexValidator(regex=
+    b'^[\\w\\-\\.]*$')])), ('teachers', models.ManyToManyField(related_name
+    ='teaching_courses', to='userprofile.UserProfile', blank=True))],
+    options={}, bases=(models.Model,)), migrations.CreateModel(name=
+    'CourseHook', fields=[('id', models.AutoField(verbose_name='ID',
+    serialize=False, auto_created=True, primary_key=True)), ('hook_url',
+    models.URLField()), ('hook_type', models.CharField(default=
+    b'post-grading', max_length=12, choices=[(b'post-grading',
+    b'Post grading')]))], options={}, bases=(models.Model,)), migrations.
+    CreateModel(name='CourseInstance', fields=[('id', models.AutoField(
+    verbose_name='ID', serialize=False, auto_created=True, primary_key=True
+    )), ('instance_name', models.CharField(max_length=255)), ('website',
+    models.URLField(max_length=255, blank=True)), ('url', models.CharField(
+    help_text=b'Input an URL identifier for this course.', max_length=255,
+    validators=[django.core.validators.RegexValidator(regex=
+    b'^[\\w\\-\\.]*$')])), ('starting_time', models.DateTimeField()), (
+    'ending_time', models.DateTimeField()), ('visible_to_students', models.
+    BooleanField(default=True)), ('assistants', models.ManyToManyField(
+    related_name='assisting_courses', to='userprofile.UserProfile', blank=
+    True)), ('course', models.ForeignKey(related_name='instances', to=
+    'course.Course'))], options={}, bases=(models.Model,)), migrations.
+    AlterUniqueTogether(name='courseinstance', unique_together=set([(
+    'course', 'url')])), migrations.AddField(model_name='coursehook', name=
+    'course_instance', field=models.ForeignKey(related_name='course_hooks',
+    to='course.CourseInstance'), preserve_default=True)]
+",0
+3090,"def test_rowcount_delete(self):...
+
+self.assertEqual(self.cursor.rowcount, -1)
+
+self.cursor.execute('create table t1(i int)')
+
+count = 4
+
+for i in range(count):
+
+self.cursor.execute('insert into t1 values (?)', i)
+
+self.cursor.execute('delete from t1')
+
+self.assertEqual(self.cursor.rowcount, count)
+",0
+5419,"def get_all(db):...
+
+db.cursor.execute(
+    """"""SELECT id, sheet_id, student_id, time, files_path, deleted
+           FROM submission WHERE deleted IS NOT 1""""""
+    )
+
+rows = db.cursor.fetchall()
+
+return [Submission(*row) for row in rows]
+",0
+1166,"def test_extend_volume(self):...
+
+new_size = '200'
+
+self.driver._eql_execute = self.mox.CreateMock(self.driver._eql_execute)
+
+volume = {'name': self.volume_name, 'size': 100}
+
+self.driver._eql_execute('volume', 'select', volume['name'], 'size', '%sG' %
+    new_size)
+
+self.mox.ReplayAll()
+
+self.driver.extend_volume(volume, new_size)
+",0
+3665,"def get_form_kwargs(self, *args, **kwargs):...
+
+kwargs = super().get_form_kwargs()
+
+kwargs['entry_form_config'] = entry_form_config
+
+question_ids = {str(q['id']) for q in entry_form_config}
+
+data = {f'{item}': f'{value}' for item, value in self.request.GET.items() if
+    item in question_ids}
+
+if data:
+
+kwargs['data'] = data
+
+return kwargs
+",0
+5642,"def get_placeholder(self, value, compiler, connection):...
+
+return '%s::{}'.format(self.db_type(connection))
+",0
+3217,"from flask import Flask, render_template, redirect, session, url_for
+
+from database import conn, cursor
+
+app = Flask(__name__)
+
+from views import users, message, comment, like_msg, like_cmt
+
+app.register_blueprint(users.mod)
+
+app.register_blueprint(message.mod)
+
+app.register_blueprint(comment.mod)
+
+app.register_blueprint(like_msg.mod)
+
+app.register_blueprint(like_cmt.mod)
+
+@app.route('/')...
+
+if not session.get('logged_in'):
+
+return redirect(url_for('users.login'))
+
+user_id = session['logged_id']
+
+sql = 'SELECT * FROM message where user_id = %d ORDER BY c_time DESC' % user_id
+
+cursor.execute(sql)
+
+m = cursor.fetchall()
+
+messages = list(m)
+
+for i, message in enumerate(messages):
+
+message = list(message)
+
+return render_template('show_entries.html', entries=messages)
+
+user_id = message[1]
+
+sql = 'SELECT nickname FROM users where user_id = %d' % user_id
+
+cursor.execute(sql)
+
+u = cursor.fetchone()
+
+message.append(u[0])
+
+sql = 'SELECT * FROM like_msg where msg_id = %d AND user_id = %d' % (message
+    [0], user_id)
+
+cursor.execute(sql)
+
+like = cursor.fetchone()
+
+if like is not None:
+
+like_flag = 1
+
+like_flag = 0
+
+message.append(like_flag)
+
+messages[i] = message
+",0
+2858,"@classmethod...
+
+def connect(addr, timeout):...
+
+server = create_server(addr)
+
+client, _ = server.accept()
+
+return Connection(client, server)
+",0
+7779,"import numpy as np
+
+import matplotlib.pyplot as plt
+
+import pandas as pd
+
+dataset = pd.read_csv('Data.csv')
+
+X = dataset.iloc[:, :-1].values
+
+y = dataset.iloc[:, (-1)].values
+",0
+996,"def prepare(self):...
+
+""""""docstring""""""
+
+if not validate_host(self.request.host):
+",0
+6297,"def newConnection(self):...
+
+args = self._dbArgs.copy()
+
+self.augmentDatabaseArgs(args)
+
+return self.dbapiModule().connect(**args)
+",0
+3187,"import json as json_module
+
+import logging
+
+import sys
+
+from citest.service_testing import HttpContractBuilder
+
+from citest.service_testing import NoOpOperation
+
+import citest.gcp_testing as gcp
+
+import citest.json_contract as jc
+
+import citest.service_testing as st
+
+import spinnaker_testing as sk
+
+import spinnaker_testing.kato as kato
+
+use_instance_names = []
+
+use_instance_zones = []
+
+__use_lb_name = ''
+
+__use_lb_tp_name = ''
+
+__use_lb_hc_name = ''
+
+__use_lb_target = ''
+
+__use_http_lb_name = ''
+
+__use_http_lb_proxy_name = ''
+
+__use_http_lb_hc_name = ''
+
+__use_http_lb_bs_name = ''
+
+__use_http_lb_fr_name = ''
+
+__use_http_lb_map_name = ''
+
+__use_http_lb_http_proxy_name = ''
+
+@classmethod...
+
+""""""docstring""""""
+
+return kato.new_agent(bindings)
+",1
+12582,"Incorrect Block Delimitation
+
+The code does not explicitly delimit a block that is intended to contain 2 or more statements, creating a logic error.
+
+In some languages, braces (or other delimiters) are optional for blocks. When the delimiter is omitted, it is possible to insert a logic error in which a statement is thought to be in a block but is not. In some cases, the logic error can have security implications.",1
+1059,"def users(self):...
+
+query = strip_parameters(self.request.GET, skip_parameters=('info_type',
+    'field', 'format'))
+
+return User.objects.filter(**query)
+",0
+13276,"import sqlite3
+from flask import Flask, request
+
+app = Flask(__name__)
+
+@app.route('/login', methods=['POST'])
+def login():
+    username = request.form['username']
+    password = request.form['password']
+    
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    
+    query = ""SELECT * FROM users WHERE username='{}' AND password='{}'"".format(username, password)
+    cursor.execute(query)
+    
+    if cursor.fetchone():
+        return 'Login successful!'
+    else:
+        return 'Invalid credentials!'
+
+if __name__ == '__main__':
+    app.run(debug=True)",1
+13127,"def format_string(user_input):
+    return ""Hello, %s!"" % user_input
+
+while True:
+    user_input = input(""Enter your name: "")
+    print(format_string(user_input))",1
+5635,"import numpy as np
+
+import matplotlib.pyplot as plt
+
+import pandas as pd
+
+dataset = pd.read_csv('Social_Network_Ads.csv')
+
+X = dataset.iloc[:, ([2, 3])].values
+
+y = dataset.iloc[:, (4)].values
+
+from sklearn.model_selection import train_test_split
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25,
+    random_state=0)
+
+from sklearn.preprocessing import StandardScaler
+
+sc = StandardScaler()
+
+X_train = sc.fit_transform(X_train)
+
+X_test = sc.transform(X_test)
+
+y_pred = classifier.predict(X_test)
+
+from sklearn.metrics import confusion_matrix
+
+cm = confusion_matrix(y_test, y_pred)
+
+from matplotlib.colors import ListedColormap
+
+X_set, y_set = X_train, y_train
+
+X1, X2 = np.meshgrid(np.arange(start=X_set[:, (0)].min() - 1, stop=X_set[:,
+    (0)].max() + 1, step=0.01), np.arange(start=X_set[:, (1)].min() - 1,
+    stop=X_set[:, (1)].max() + 1, step=0.01))
+
+plt.contourf(X1, X2, classifier.predict(np.array([X1.ravel(), X2.ravel()]).
+    T).reshape(X1.shape), alpha=0.75, cmap=ListedColormap(('red', 'green')))
+
+plt.xlim(X1.min(), X1.max())
+
+plt.ylim(X2.min(), X2.max())
+
+for i, j in enumerate(np.unique(y_set)):
+
+plt.scatter(X_set[y_set == j, 0], X_set[y_set == j, 1], c=ListedColormap((
+    'red', 'green'))(i), label=j)
+
+plt.title('Classifier (Training set)')
+
+plt.xlabel('Age')
+
+plt.ylabel('Estimated Salary')
+
+plt.legend()
+
+plt.show()
+
+from matplotlib.colors import ListedColormap
+
+X_set, y_set = X_test, y_test
+
+X1, X2 = np.meshgrid(np.arange(start=X_set[:, (0)].min() - 1, stop=X_set[:,
+    (0)].max() + 1, step=0.01), np.arange(start=X_set[:, (1)].min() - 1,
+    stop=X_set[:, (1)].max() + 1, step=0.01))
+
+plt.contourf(X1, X2, classifier.predict(np.array([X1.ravel(), X2.ravel()]).
+    T).reshape(X1.shape), alpha=0.75, cmap=ListedColormap(('red', 'green')))
+
+plt.xlim(X1.min(), X1.max())
+
+plt.ylim(X2.min(), X2.max())
+
+for i, j in enumerate(np.unique(y_set)):
+
+plt.scatter(X_set[y_set == j, 0], X_set[y_set == j, 1], c=ListedColormap((
+    'red', 'green'))(i), label=j)
+
+plt.title('Classifier (Test set)')
+
+plt.xlabel('Age')
+
+plt.ylabel('Estimated Salary')
+
+plt.legend()
+
+plt.show()
+",0
+8884,"def __init__(self, txt):...
+
+if txt.find('\t') > -1:
+
+txt = txt.replace('\t', '    ')
+
+super(Document, self).__init__(docParser.parse(txt, docLexer), after=self.end)
+
+warn(
+    ""Input file has tabs, which will be considered 4 spaces; but please don't use tabs!""
+    )
+
+Config.resolve()
+
+debug('Final config', Config.effectiveConfig)
+
+ListItem.resolve(self.children)
+
+Column.resolve(self.children)
+
+VerbatimEnv.resolve()
+
+packageDef = self.splitCmd(self.docClassCmd, Config.getRaw('docclass'))
+
+for pkg in Config.effectiveConfig['packages']:
+
+packageDef += self.splitCmd(self.packageCmd, pkg)
+
+packageDef += '\n'
+
+outerPreamble = ''
+
+for k in self.preambleCmds:
+
+if k in Config.effectiveConfig:
+
+innerPreamble = VerbatimEnv.preambleDefs
+
+outerPreamble += self.preambleCmds[k] % Config.getRaw(k)
+
+if Config.effectiveConfig.get('titlepage', 'no') in ['yes', 'y', 'true', True]:
+
+innerPreamble += self.titlePageCmd
+
+self.before = packageDef + outerPreamble + self.begin + innerPreamble
+",0
+6214,"@property...
+
+""""""docstring""""""
+
+return self._server_version
+",0
+13891,"# This is a vulnerable code snippet.
+# Do not run this code as it is vulnerable.
+
+import os
+
+def execute_command():
+    command = raw_input(""Enter your command: "")
+    os.system(command)
+
+execute_command()",1
+8443,"# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+#
+# Copyright (C) 2021, James R. Barlow (https://github.com/jbarlow83/)
+
+
+from typing import IO, Any, AnyStr, Union
+
+from lxml.etree import XMLParser as _UnsafeXMLParser
+from lxml.etree import parse as _parse
+
+
+class _XMLParser(_UnsafeXMLParser):
+    def __init__(self, *args, **kwargs):
+        # Prevent XXE attacks
+        # https://rules.sonarsource.com/python/type/Vulnerability/RSPEC-2755
+        kwargs['resolve_entities'] = False
+        kwargs['no_network'] = True
+        super().__init__(*args, **kwargs)
+
+
+def parse_xml(source: Union[AnyStr, IO[Any]], recover: bool = False):
+    """"""Wrapper around lxml's parse to provide protection against XXE attacks.""""""
+
+    parser = _XMLParser(recover=recover, remove_pis=False)
+    return _parse(source, parser=parser)
+
+
+__all__ = ['parse_xml']
+from lxml.etree import QName, XMLSyntaxError
+from .._xml import parse_xml
+            return parse_xml(BytesIO(xml))
+            return parse_xml(BytesIO(re_xml_illegal_bytes.sub(b'', xml)))
+            return parse_xml(BytesIO(xml), recover=True)
+
+
+def test_xxe(trivial, outdir):
+    secret = outdir / 'secret.txt'
+    secret.write_text(""This is a secret"")
+    trivial.Root.Metadata = Stream(
+        trivial,
+        b""""""\
+<?xpacket begin='\xef\xbb\xbf' id='W5M0MpCehiHzreSzNTczkc9d'?>
+<!DOCTYPE rdf:RDF [<!ENTITY xxe SYSTEM ""file://%s"">]>
+<x:xmpmeta xmlns:x='adobe:ns:meta/' x:xmptk='Image'>
+<rdf:RDF xmlns:rdf=""http://www.w3.org/1999/02/22-rdf-syntax-ns#"">
+<note>
+<to>&xxe;</to>
+<from>xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx</from>
+</note>
+</rdf:RDF>
+</x:xmpmeta>
+<?xpacket end='w'?>
+    """"""
+        % os.fsencode(secret),
+    )
+    with trivial.open_metadata() as m:
+        assert 'This is a secret' not in str(m)",0
+6868,"def post(self, request, *args, **kwargs):...
+
+if not self.exercise.is_submittable:
+
+return self.http_method_not_allowed(request, *args, **kwargs)
+
+new_submission = None
+
+page = ExercisePage(self.exercise)
+
+submission_status, submission_allowed, issues, students = (self.
+    submission_check(True, request))
+
+if submission_allowed:
+
+new_submission = Submission.objects.create_from_post(self.exercise,
+    students, request)
+
+self.get_summary_submissions()
+
+if new_submission:
+
+return self.response(page=page, students=students, submission=new_submission)
+
+page = self.exercise.grade(request, new_submission, url_name=self.post_url_name
+    )
+
+messages.error(request, _(
+    'The submission could not be saved for some reason. The submission was not registered.'
+    ))
+
+if self.exercise.status in (LearningObject.STATUS.ENROLLMENT,
+
+if not request.is_ajax() and '__r' in request.GET:
+
+self.instance.enroll_student(self.request.user)
+
+if not request.is_ajax() and '__r' not in request.GET:
+
+return self.redirect(request.GET['__r'], backup=self.exercise)
+
+return self.redirect(new_submission.get_absolute_url() + ('?wait=1' if page
+    .is_wait else ''))
+",0
+9110,"import string
+import hypothesis.strategies as st
+from hypothesis import given, settings
+
+
+# TODO probably want to refactor these into general test utils
+st_uint256 = st.integers(min_value=0, max_value=2**256 - 1)
+st_string65 = st.text(max_size=65, alphabet=string.printable)
+st_bytes65 = st.binary(max_size=65)
+st_sarray3 = st.lists(st_uint256, min_size=3, max_size=3)
+st_darray3 = st.lists(st_uint256, max_size=3)
+
+internal_call_kwargs_cases = [
+    (""uint256"", st_uint256),
+    (""String[65]"", st_string65),
+    (""Bytes[65]"", st_bytes65),
+    (""uint256[3]"", st_sarray3),
+    (""DynArray[uint256, 3]"", st_darray3),
+]
+
+
+@pytest.mark.parametrize(""typ1,strategy1"", internal_call_kwargs_cases)
+@pytest.mark.parametrize(""typ2,strategy2"", internal_call_kwargs_cases)
+def test_internal_call_kwargs(get_contract, typ1, strategy1, typ2, strategy2):
+    # GHSA-ph9x-4vc9-m39g
+
+    @given(kwarg1=strategy1, default1=strategy1, kwarg2=strategy2, default2=strategy2)
+    @settings(deadline=None, max_examples=5)  # len(cases) * len(cases) * 5 * 5
+    def fuzz(kwarg1, kwarg2, default1, default2):
+        code = f""""""
+@internal
+def foo(a: {typ1} = {repr(default1)}, b: {typ2} = {repr(default2)}) -> ({typ1}, {typ2}):
+    return a, b
+
+@external
+def test0() -> ({typ1}, {typ2}):
+    return self.foo()
+
+@external
+def test1() -> ({typ1}, {typ2}):
+    return self.foo({repr(kwarg1)})
+
+@external
+def test2() -> ({typ1}, {typ2}):
+    return self.foo({repr(kwarg1)}, {repr(kwarg2)})
+
+@external
+def test3(x1: {typ1}) -> ({typ1}, {typ2}):
+    return self.foo(x1)
+
+@external
+def test4(x1: {typ1}, x2: {typ2}) -> ({typ1}, {typ2}):
+    return self.foo(x1, x2)
+        """"""
+        c = get_contract(code)
+        assert c.test0() == [default1, default2]
+        assert c.test1() == [kwarg1, default2]
+        assert c.test2() == [kwarg1, kwarg2]
+        assert c.test3(kwarg1) == [kwarg1, default2]
+        assert c.test4(kwarg1, kwarg2) == [kwarg1, kwarg2]
+
+    fuzz()
+        kw_vals = list(sig.default_values.values())[num_provided_kwargs:]",0
+5567,"def deletePlayers():...
+
+""""""docstring""""""
+
+_commit('DELETE FROM players')
+",0
+1982,"def __str__(self):...
+
+return ' '.join(self.cmd)
+",0
+6015,"@tornado.web.asynchronous...
+
+""""""docstring""""""
+
+future = tornado.concurrent.Future()
+
+def get_final_html_async():...
+
+operation_content_raw = self.request.body
+
+operation_content = json.loads(operation_content_raw.decode('utf-8', 'ignore'))
+
+action = operation_content['action']
+
+sources = operation_content['source']
+
+if type(sources) == list:
+
+for i in range(0, len(sources)):
+
+sources = decode_hexed_b64_to_str(sources)
+
+sources[i] = decode_hexed_b64_to_str(sources[i])
+
+if action in ['copy', 'move']:
+
+if action in ['rename', 'new-folder']:
+
+target = decode_hexed_b64_to_str(operation_content['target'])
+
+target = '/'
+
+if action == 'copy':
+
+target = operation_content['target']
+
+target = sources
+
+for source in sources:
+
+if action == 'move':
+
+db.Filesystem.copy(source, target, new_owner='user-cp')
+
+future.set_result('')
+
+for source in sources:
+
+if action == 'delete':
+
+tornado.ioloop.IOLoop.instance().add_callback(get_final_html_async)
+
+db.Filesystem.move(source, target)
+
+for source in sources:
+
+if action == 'rename':
+
+file_temp = yield future
+
+db.Filesystem.remove(source)
+
+db.Filesystem.rename(sources, target)
+
+if action == 'new-folder':
+
+self.set_status(200, 'OK')
+
+db.Filesystem.mkdir(sources, target, 'user-nf')
+
+self.add_header('Cache-Control', 'max-age=0')
+
+self.add_header('Connection', 'close')
+
+self.add_header('Content-Type', 'text/html')
+
+self.add_header('Content-Length', str(len(file_temp)))
+
+self.write(file_temp)
+
+self.flush()
+
+self.finish()
+
+return self
+",0
+5132,"""""""Miscellaneous utility functions and classes.
+
+This module is used internally by Tornado.  It is not necessarily expected
+that the functions and classes defined here will be useful to other
+applications, but they are documented here in case they are.
+
+The one public-facing part of this module is the `Configurable` class
+and its `~Configurable.configure` method, which becomes a part of the
+interface of its subclasses, including `.AsyncHTTPClient`, `.IOLoop`,
+and `.Resolver`.
+""""""
+
+from __future__ import absolute_import, division, print_function, with_statement
+
+import inspect
+import sys
+import zlib
+
+
+class ObjectDict(dict):
+    """"""Makes a dictionary behave like an object, with attribute-style access.
+    """"""
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError:
+            raise AttributeError(name)
+
+    def __setattr__(self, name, value):
+        self[name] = value
+
+
+class GzipDecompressor(object):
+    """"""Streaming gzip decompressor.
+
+    The interface is like that of `zlib.decompressobj` (without the
+    optional arguments, but it understands gzip headers and checksums.
+    """"""
+    def __init__(self):
+        # Magic parameter makes zlib module understand gzip header
+        # http://stackoverflow.com/questions/1838699/how-can-i-decompress-a-gzip-stream-with-zlib
+        # This works on cpython and pypy, but not jython.
+        self.decompressobj = zlib.decompressobj(16 + zlib.MAX_WBITS)
+
+    def decompress(self, value):
+        """"""Decompress a chunk, returning newly-available data.
+
+        Some data may be buffered for later processing; `flush` must
+        be called when there is no more input data to ensure that
+        all data was processed.
+        """"""
+        return self.decompressobj.decompress(value)
+
+    def flush(self):
+        """"""Return any remaining buffered data not yet returned by decompress.
+
+        Also checks for errors such as truncated input.
+        No other methods may be called on this object after `flush`.
+        """"""
+        return self.decompressobj.flush()
+
+
+def import_object(name):
+    """"""Imports an object by name.
+
+    import_object('x') is equivalent to 'import x'.
+    import_object('x.y.z') is equivalent to 'from x.y import z'.
+
+    >>> import tornado.escape
+    >>> import_object('tornado.escape') is tornado.escape
+    True
+    >>> import_object('tornado.escape.utf8') is tornado.escape.utf8
+    True
+    >>> import_object('tornado') is tornado
+    True
+    >>> import_object('tornado.missing_module')
+    Traceback (most recent call last):
+        ...
+    ImportError: No module named missing_module
+    """"""
+    if name.count('.') == 0:
+        return __import__(name, None, None)
+
+    parts = name.split('.')
+    obj = __import__('.'.join(parts[:-1]), None, None, [parts[-1]], 0)
+    try:
+        return getattr(obj, parts[-1])
+    except AttributeError:
+        raise ImportError(""No module named %s"" % parts[-1])
+
+
+# Fake unicode literal support:  Python 3.2 doesn't have the u'' marker for
+# literal strings, and alternative solutions like ""from __future__ import
+# unicode_literals"" have other problems (see PEP 414).  u() can be applied
+# to ascii strings that include \u escapes (but they must not contain
+# literal non-ascii characters).
+if type('') is not type(b''):
+    def u(s):
+        return s
+    bytes_type = bytes
+    unicode_type = str
+    basestring_type = str
+else:
+    def u(s):
+        return s.decode('unicode_escape')
+    bytes_type = str
+    unicode_type = unicode
+    basestring_type = basestring
+
+
+if sys.version_info > (3,):
+    exec(""""""
+def raise_exc_info(exc_info):
+    raise exc_info[1].with_traceback(exc_info[2])
+
+def exec_in(code, glob, loc=None):
+    if isinstance(code, str):
+        code = compile(code, '<string>', 'exec', dont_inherit=True)
+    exec(code, glob, loc)
+"""""")
+else:
+    exec(""""""
+def raise_exc_info(exc_info):
+    raise exc_info[0], exc_info[1], exc_info[2]
+
+def exec_in(code, glob, loc=None):
+    if isinstance(code, basestring):
+        # exec(string) inherits the caller's future imports; compile
+        # the string first to prevent that.
+        code = compile(code, '<string>', 'exec', dont_inherit=True)
+    exec code in glob, loc
+"""""")
+
+
+class Configurable(object):
+    """"""Base class for configurable interfaces.
+
+    A configurable interface is an (abstract) class whose constructor
+    acts as a factory function for one of its implementation subclasses.
+    The implementation subclass as well as optional keyword arguments to
+    its initializer can be set globally at runtime with `configure`.
+
+    By using the constructor as the factory method, the interface
+    looks like a normal class, `isinstance` works as usual, etc.  This
+    pattern is most useful when the choice of implementation is likely
+    to be a global decision (e.g. when `~select.epoll` is available,
+    always use it instead of `~select.select`), or when a
+    previously-monolithic class has been split into specialized
+    subclasses.
+
+    Configurable subclasses must define the class methods
+    `configurable_base` and `configurable_default`, and use the instance
+    method `initialize` instead of ``__init__``.
+    """"""
+    __impl_class = None
+    __impl_kwargs = None
+
+    def __new__(cls, **kwargs):
+        base = cls.configurable_base()
+        args = {}
+        if cls is base:
+            impl = cls.configured_class()
+            if base.__impl_kwargs:
+                args.update(base.__impl_kwargs)
+        else:
+            impl = cls
+        args.update(kwargs)
+        instance = super(Configurable, cls).__new__(impl)
+        # initialize vs __init__ chosen for compatiblity with AsyncHTTPClient
+        # singleton magic.  If we get rid of that we can switch to __init__
+        # here too.
+        instance.initialize(**args)
+        return instance
+
+    @classmethod
+    def configurable_base(cls):
+        """"""Returns the base class of a configurable hierarchy.
+
+        This will normally return the class in which it is defined.
+        (which is *not* necessarily the same as the cls classmethod parameter).
+        """"""
+        raise NotImplementedError()
+
+    @classmethod
+    def configurable_default(cls):
+        """"""Returns the implementation class to be used if none is configured.""""""
+        raise NotImplementedError()
+
+    def initialize(self):
+        """"""Initialize a `Configurable` subclass instance.
+
+        Configurable classes should use `initialize` instead of ``__init__``.
+        """"""
+
+    @classmethod
+    def configure(cls, impl, **kwargs):
+        """"""Sets the class to use when the base class is instantiated.
+
+        Keyword arguments will be saved and added to the arguments passed
+        to the constructor.  This can be used to set global defaults for
+        some parameters.
+        """"""
+        base = cls.configurable_base()
+        if isinstance(impl, (unicode_type, bytes_type)):
+            impl = import_object(impl)
+        if impl is not None and not issubclass(impl, cls):
+            raise ValueError(""Invalid subclass of %s"" % cls)
+        base.__impl_class = impl
+        base.__impl_kwargs = kwargs
+
+    @classmethod
+    def configured_class(cls):
+        """"""Returns the currently configured class.""""""
+        base = cls.configurable_base()
+        if cls.__impl_class is None:
+            base.__impl_class = cls.configurable_default()
+        return base.__impl_class
+
+    @classmethod
+    def _save_configuration(cls):
+        base = cls.configurable_base()
+        return (base.__impl_class, base.__impl_kwargs)
+
+    @classmethod
+    def _restore_configuration(cls, saved):
+        base = cls.configurable_base()
+        base.__impl_class = saved[0]
+        base.__impl_kwargs = saved[1]
+
+
+class ArgReplacer(object):
+    """"""Replaces one value in an ``args, kwargs`` pair.
+
+    Inspects the function signature to find an argument by name
+    whether it is passed by position or keyword.  For use in decorators
+    and similar wrappers.
+    """"""
+    def __init__(self, func, name):
+        self.name = name
+        try:
+            self.arg_pos = inspect.getargspec(func).args.index(self.name)
+        except ValueError:
+            # Not a positional parameter
+            self.arg_pos = None
+
+    def replace(self, new_value, args, kwargs):
+        """"""Replace the named argument in ``args, kwargs`` with ``new_value``.
+
+        Returns ``(old_value, args, kwargs)``.  The returned ``args`` and
+        ``kwargs`` objects may not be the same as the input objects, or
+        the input objects may be mutated.
+
+        If the named argument was not found, ``new_value`` will be added
+        to ``kwargs`` and None will be returned as ``old_value``.
+        """"""
+        if self.arg_pos is not None and len(args) > self.arg_pos:
+            # The arg to replace is passed positionally
+            old_value = args[self.arg_pos]
+            args = list(args)  # *args is normally a tuple
+            args[self.arg_pos] = new_value
+        else:
+            # The arg to replace is either omitted or passed by keyword.
+            old_value = kwargs.get(self.name)
+            kwargs[self.name] = new_value
+        return old_value, args, kwargs
+
+
+def doctests():
+    import doctest
+    return doctest.DocTestSuite()
+",1
+5403,"def _validate_executable(self, name):...
+
+def bin_paths():...
+
+yield self._bin_path
+
+if self._is_jdk:
+
+yield os.path.join(self.home, 'jre', 'bin')
+
+for bin_path in bin_paths():
+
+exe = os.path.join(bin_path, name)
+
+if self._is_executable(exe):
+
+return exe
+",0
+11601,"#!/usr/bin/env python
+
+import saml2
+
+from saml2 import create_class_from_xml_string, class_name, make_vals, md
+from saml2.saml import NameID, Issuer, SubjectLocality, AuthnContextClassRef
+from saml2.saml import SubjectConfirmationData, SubjectConfirmation
+from saml2.saml import Attribute
+
+from py.test import raises
+import saml2_data
+
+try:
+    from xml.etree import cElementTree as ElementTree
+except ImportError:
+    try:
+        import cElementTree as ElementTree
+    except ImportError:
+        from elementtree import ElementTree
+from defusedxml.common import EntitiesForbidden
+
+ITEMS = {
+    NameID: [""""""<?xml version=""1.0"" encoding=""utf-8""?>
+<NameID xmlns=""urn:oasis:names:tc:SAML:2.0:assertion""
+  Format=""urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress""
+  SPProvidedID=""sp provided id"">
+  roland@example.com
+</NameID>
+"""""", """"""<?xml version=""1.0"" encoding=""utf-8""?>
+<NameID xmlns=""urn:oasis:names:tc:SAML:2.0:assertion""
+  SPNameQualifier=""https://foo.example.com/sp"" 
+  Format=""urn:oasis:names:tc:SAML:2.0:nameid-format:transient"">_1632879f09d08ea5ede2dc667cbed7e429ebc4335c</NameID>
+"""""", """"""<?xml version=""1.0"" encoding=""utf-8""?>
+<NameID xmlns=""urn:oasis:names:tc:SAML:2.0:assertion""
+Format=""urn:oasis:names:tc:SAML:2.0:nameid-format:persistent""
+NameQualifier=""http://authentic.example.com/saml/metadata""
+SPNameQualifier=""http://auth.example.com/saml/metadata"">test
+</NameID>""""""],
+    Issuer: """"""<?xml version=""1.0"" encoding=""utf-8""?>
+<Issuer xmlns=""urn:oasis:names:tc:SAML:2.0:assertion"">
+  http://www.example.com/test
+</Issuer>
+"""""",
+    SubjectLocality: """"""<?xml version=""1.0"" encoding=""utf-8""?>
+<SubjectLocality xmlns=""urn:oasis:names:tc:SAML:2.0:assertion""
+  Address=""127.0.0.1"" DNSName=""localhost""/>
+"""""",
+    SubjectConfirmationData:
+        """"""<?xml version=""1.0"" encoding=""utf-8""?>
+<SubjectConfirmationData xmlns=""urn:oasis:names:tc:SAML:2.0:assertion""
+InResponseTo=""_1683146e27983964fbe7bf8f08961108d166a652e5"" 
+NotOnOrAfter=""2010-02-18T13:52:13.959Z"" 
+NotBefore=""2010-01-16T12:00:00Z"" 
+Recipient=""http://192.168.0.10/saml/sp"" />"""""",
+    SubjectConfirmation:
+        """"""<?xml version=""1.0"" encoding=""utf-8""?>
+<SubjectConfirmation xmlns=""urn:oasis:names:tc:SAML:2.0:assertion""
+Method=""urn:oasis:names:tc:SAML:2.0:cm:bearer""><NameID
+Format=""urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress""
+NameQualifier=""http://authentic.example.com/saml/metadata"">test@example.com
+</NameID>
+<SubjectConfirmationData
+NotOnOrAfter=""2010-02-17T17:02:38Z""
+Recipient=""http://auth.example.com/saml/proxySingleSignOnRedirect""
+InResponseTo=""_59B3A01B03334032C31E434C63F89E3E""/></SubjectConfirmation>""""""
+}
+
+#def pytest_generate_tests(metafunc):
+#    if ""target_class"" in metafunc.funcargnames:
+#        for tcl,xml in ITEMS.items():
+#            metafunc.addcall(funcargs={""target_class"":tcl,""xml_string"":xml})
+
+def _eq(l1, l2):
+    return set(l1) == set(l2)
+
+
+def test_create_class_from_xml_string_nameid():
+    kl = create_class_from_xml_string(NameID, ITEMS[NameID][0])
+    assert kl != None
+    assert kl.format == ""urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress""
+    assert kl.sp_provided_id == ""sp provided id""
+    assert kl.text.strip() == ""roland@example.com""
+    assert _eq(kl.keyswv(), ['sp_provided_id', 'format', 'text'])
+    assert class_name(kl) == ""urn:oasis:names:tc:SAML:2.0:assertion:NameID""
+    assert _eq(kl.keys(), ['sp_provided_id', 'sp_name_qualifier',
+                           'name_qualifier', 'format', 'text'])
+
+    kl = create_class_from_xml_string(NameID, ITEMS[NameID][1])
+    assert kl != None
+    assert kl.format == ""urn:oasis:names:tc:SAML:2.0:nameid-format:transient""
+    assert kl.sp_name_qualifier == ""https://foo.example.com/sp""
+    assert kl.text.strip() == ""_1632879f09d08ea5ede2dc667cbed7e429ebc4335c""
+    assert _eq(kl.keyswv(), ['sp_name_qualifier', 'format', 'text'])
+    assert class_name(kl) == ""urn:oasis:names:tc:SAML:2.0:assertion:NameID""
+
+    kl = create_class_from_xml_string(NameID, ITEMS[NameID][2])
+    assert kl != None
+    assert kl.format == ""urn:oasis:names:tc:SAML:2.0:nameid-format:persistent""
+    assert kl.name_qualifier == ""http://authentic.example.com/saml/metadata""
+    assert kl.sp_name_qualifier == ""http://auth.example.com/saml/metadata""
+    assert kl.text.strip() == ""test""
+    assert _eq(kl.keyswv(), ['sp_name_qualifier', 'format', 'name_qualifier',
+                             'text'])
+    assert class_name(kl) == ""urn:oasis:names:tc:SAML:2.0:assertion:NameID""
+
+
+def test_create_class_from_xml_string_issuer():
+    kl = create_class_from_xml_string(Issuer, ITEMS[Issuer])
+    assert kl != None
+    assert kl.text.strip() == ""http://www.example.com/test""
+    assert _eq(kl.keyswv(), ['text'])
+    assert class_name(kl) == ""urn:oasis:names:tc:SAML:2.0:assertion:Issuer""
+
+
+def test_create_class_from_xml_string_subject_locality():
+    kl = create_class_from_xml_string(SubjectLocality, ITEMS[SubjectLocality])
+    assert kl != None
+    assert _eq(kl.keyswv(), ['address', ""dns_name""])
+    assert kl.address == ""127.0.0.1""
+    assert kl.dns_name == ""localhost""
+    assert class_name(
+        kl) == ""urn:oasis:names:tc:SAML:2.0:assertion:SubjectLocality""
+
+
+def test_create_class_from_xml_string_subject_confirmation_data():
+    kl = create_class_from_xml_string(SubjectConfirmationData,
+                                      ITEMS[SubjectConfirmationData])
+    assert kl != None
+    assert _eq(kl.keyswv(), ['in_response_to', 'not_on_or_after',
+                             'not_before', 'recipient'])
+    assert kl.in_response_to == ""_1683146e27983964fbe7bf8f08961108d166a652e5""
+    assert kl.not_on_or_after == ""2010-02-18T13:52:13.959Z""
+    assert kl.not_before == ""2010-01-16T12:00:00Z""
+    assert kl.recipient == ""http://192.168.0.10/saml/sp""
+    assert class_name(kl) == \
+           ""urn:oasis:names:tc:SAML:2.0:assertion:SubjectConfirmationData""
+
+
+def test_create_class_from_xml_string_subject_confirmation():
+    kl = create_class_from_xml_string(SubjectConfirmation,
+                                      ITEMS[SubjectConfirmation])
+    assert kl != None
+    assert _eq(kl.keyswv(), ['method', 'name_id',
+                             'subject_confirmation_data'])
+    assert kl.method == ""urn:oasis:names:tc:SAML:2.0:cm:bearer""
+    name_id = kl.name_id
+    assert _eq(name_id.keyswv(), ['format', 'name_qualifier', 'text'])
+    assert name_id.format == ""urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress""
+    assert name_id.name_qualifier == ""http://authentic.example.com/saml/metadata""
+    assert name_id.text.strip() == ""test@example.com""
+    subject_confirmation_data = kl.subject_confirmation_data
+    assert _eq(subject_confirmation_data.keyswv(), ['not_on_or_after',
+                                                    'recipient',
+                                                    'in_response_to'])
+    assert subject_confirmation_data.recipient == \
+           ""http://auth.example.com/saml/proxySingleSignOnRedirect""
+    assert subject_confirmation_data.not_on_or_after == ""2010-02-17T17:02:38Z""
+    assert subject_confirmation_data.in_response_to == \
+           ""_59B3A01B03334032C31E434C63F89E3E""
+    assert class_name(kl) == \
+           ""urn:oasis:names:tc:SAML:2.0:assertion:SubjectConfirmation""
+
+
+def test_create_class_from_xml_string_wrong_class_spec():
+    kl = create_class_from_xml_string(SubjectConfirmationData,
+                                      ITEMS[SubjectConfirmation])
+    assert kl == None
+
+
+def test_create_class_from_xml_string_xxe():
+    xml = """"""<?xml version=""1.0""?>
+    <!DOCTYPE lolz [
+    <!ENTITY lol ""lol"">
+    <!ELEMENT lolz (#PCDATA)>
+    <!ENTITY lol1 ""&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;"">
+    ]>
+    <lolz>&lol1;</lolz>
+    """"""
+    with raises(EntitiesForbidden) as err:
+        create_class_from_xml_string(NameID, xml)
+
+
+def test_ee_1():
+    ee = saml2.extension_element_from_string(
+        """"""<?xml version='1.0' encoding='UTF-8'?><foo>bar</foo>"""""")
+    assert ee != None
+    print(ee.__dict__)
+    assert ee.attributes == {}
+    assert ee.tag == ""foo""
+    assert ee.namespace == None
+    assert ee.children == []
+    assert ee.text == ""bar""
+
+
+def test_ee_2():
+    ee = saml2.extension_element_from_string(
+        """"""<?xml version='1.0' encoding='UTF-8'?><foo id=""xyz"">bar</foo>"""""")
+    assert ee != None
+    print(ee.__dict__)
+    assert ee.attributes == {""id"": ""xyz""}
+    assert ee.tag == ""foo""
+    assert ee.namespace == None
+    assert ee.children == []
+    assert ee.text == ""bar""
+
+
+def test_ee_3():
+    ee = saml2.extension_element_from_string(
+        """"""<?xml version='1.0' encoding='UTF-8'?>
+        <foo xmlns=""urn:mace:example.com:saml:ns"" 
+        id=""xyz"">bar</foo>"""""")
+    assert ee != None
+    print(ee.__dict__)
+    assert ee.attributes == {""id"": ""xyz""}
+    assert ee.tag == ""foo""
+    assert ee.namespace == ""urn:mace:example.com:saml:ns""
+    assert ee.children == []
+    assert ee.text == ""bar""
+
+
+def test_ee_4():
+    ee = saml2.extension_element_from_string(
+        """"""<?xml version='1.0' encoding='UTF-8'?>
+        <foo xmlns=""urn:mace:example.com:saml:ns"">
+        <id>xyz</id><bar>tre</bar></foo>"""""")
+    assert ee != None
+    print(ee.__dict__)
+    assert ee.attributes == {}
+    assert ee.tag == ""foo""
+    assert ee.namespace == ""urn:mace:example.com:saml:ns""
+    assert len(ee.children) == 2
+    assert ee.text.strip() == """"
+    cid = ee.find_children(""id"", ""urn:mace:example.com:saml:namespace"")
+    assert cid == []
+    ids = ee.find_children(""id"", ""urn:mace:example.com:saml:ns"")
+    assert ids != []
+    cid = ids[0]
+    print(cid.__dict__)
+    assert cid.attributes == {}
+    assert cid.tag == ""id""
+    assert cid.namespace == ""urn:mace:example.com:saml:ns""
+    assert cid.children == []
+    assert cid.text.strip() == ""xyz""
+
+
+def test_ee_5():
+    ee = saml2.extension_element_from_string(
+        """"""<?xml version='1.0' encoding='UTF-8'?>
+        <foo xmlns=""urn:mace:example.com:saml:ns"">bar</foo>"""""")
+
+    ce = saml2.extension_element_from_string(
+        """"""<?xml version='1.0' encoding='UTF-8'?>
+        <educause xmlns=""urn:mace:example.com:saml:cu"">rev</educause>"""""")
+
+    ee.children.append(ce)
+
+    assert ee != None
+    print(ee.__dict__)
+    assert ee.attributes == {}
+    assert ee.tag == ""foo""
+    assert ee.namespace == ""urn:mace:example.com:saml:ns""
+    assert len(ee.children) == 1
+    assert ee.text.strip() == ""bar""
+
+    c = ee.children[0]
+    print(c.__dict__)
+
+    child = ee.find_children(namespace=""urn:mace:example.com:saml:cu"")
+    assert len(child) == 1
+    child = ee.find_children(namespace=""urn:mace:example.com:saml:ns"")
+    assert len(child) == 0
+    child = ee.find_children(""educause"", ""urn:mace:example.com:saml:cu"")
+    assert len(child) == 1
+    child = ee.find_children(""edugain"", ""urn:mace:example.com:saml:cu"")
+    assert len(child) == 0
+    print(ee.to_string())
+
+
+def test_ee_6():
+    ee = saml2.extension_element_from_string(
+        """"""<?xml version='1.0' encoding='UTF-8'?>
+        <foo xmlns=""urn:mace:example.com:saml:ns"">bar</foo>"""""")
+
+    ce = saml2.extension_element_from_string(
+        """"""<?xml version='1.0' encoding='UTF-8'?>
+        <educause xmlns=""urn:mace:example.com:saml:cu"">rev</educause>"""""")
+
+    et = ee.transfer_to_element_tree()
+    ce.become_child_element_of(et)
+
+    pee = saml2._extension_element_from_element_tree(et)
+
+    assert pee != None
+    print(pee.__dict__)
+    assert pee.attributes == {}
+    assert pee.tag == ""foo""
+    assert pee.namespace == ""urn:mace:example.com:saml:ns""
+    assert len(pee.children) == 1
+    assert pee.text.strip() == ""bar""
+
+    c = pee.children[0]
+    print(c.__dict__)
+
+    child = pee.find_children(namespace=""urn:mace:example.com:saml:cu"")
+    assert len(child) == 1
+    child = pee.find_children(namespace=""urn:mace:example.com:saml:ns"")
+    assert len(child) == 0
+    child = pee.find_children(""educause"", ""urn:mace:example.com:saml:cu"")
+    assert len(child) == 1
+    child = pee.find_children(""edugain"", ""urn:mace:example.com:saml:cu"")
+    assert len(child) == 0
+    print(pee.to_string())
+
+
+NAMEID_WITH_ATTRIBUTE_EXTENSION = """"""<?xml version=""1.0"" encoding=""utf-8""?>
+<NameID xmlns=""urn:oasis:names:tc:SAML:2.0:assertion""
+  xmlns:local=""urn:mace:example.com:saml:assertion""
+  Format=""urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress""
+  SPProvidedID=""sp provided id""
+  local:Foo=""BAR"">
+  roland@example.com
+</NameID>
+""""""
+
+
+def test_nameid_with_extension():
+    kl = create_class_from_xml_string(NameID, NAMEID_WITH_ATTRIBUTE_EXTENSION)
+    assert kl != None
+    print(kl.__dict__)
+    assert kl.format == ""urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress""
+    assert kl.sp_provided_id == ""sp provided id""
+    assert kl.text.strip() == ""roland@example.com""
+    assert _eq(kl.keyswv(), ['sp_provided_id', 'format',
+                             'extension_attributes', 'text'])
+    assert class_name(kl) == ""urn:oasis:names:tc:SAML:2.0:assertion:NameID""
+    assert _eq(kl.keys(), ['sp_provided_id', 'sp_name_qualifier',
+                           'name_qualifier', 'format', 'text'])
+    assert kl.extension_attributes == {
+        '{urn:mace:example.com:saml:assertion}Foo': 'BAR'}
+
+
+SUBJECT_CONFIRMATION_WITH_MEMBER_EXTENSION = """"""<?xml version=""1.0"" encoding=""utf-8""?>
+<SubjectConfirmation xmlns=""urn:oasis:names:tc:SAML:2.0:assertion""
+Method=""urn:oasis:names:tc:SAML:2.0:cm:bearer"">
+<NameID
+Format=""urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress""
+NameQualifier=""http://authentic.example.com/saml/metadata"">test@example.com
+</NameID>
+<SubjectConfirmationData
+NotOnOrAfter=""2010-02-17T17:02:38Z""
+Recipient=""http://auth.example.com/saml/proxySingleSignOnRedirect""
+InResponseTo=""_59B3A01B03334032C31E434C63F89E3E""/>
+<local:Trustlevel xmlns:local=""urn:mace:example.com:saml:assertion"">
+Excellent
+</local:Trustlevel>
+</SubjectConfirmation>""""""
+
+
+def test_subject_confirmation_with_extension():
+    kl = create_class_from_xml_string(SubjectConfirmation,
+                                      SUBJECT_CONFIRMATION_WITH_MEMBER_EXTENSION)
+    assert kl != None
+    print(kl.__dict__)
+    assert kl.extension_attributes == {}
+    assert kl.method == ""urn:oasis:names:tc:SAML:2.0:cm:bearer""
+    name_id = kl.name_id
+    assert _eq(name_id.keyswv(), ['format', 'name_qualifier', 'text'])
+    assert name_id.format == ""urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress""
+    assert name_id.name_qualifier == ""http://authentic.example.com/saml/metadata""
+    assert name_id.text.strip() == ""test@example.com""
+    subject_confirmation_data = kl.subject_confirmation_data
+    assert _eq(subject_confirmation_data.keyswv(), ['not_on_or_after',
+                                                    'recipient',
+                                                    'in_response_to'])
+    assert subject_confirmation_data.recipient == \
+           ""http://auth.example.com/saml/proxySingleSignOnRedirect""
+    assert subject_confirmation_data.not_on_or_after == ""2010-02-17T17:02:38Z""
+    assert subject_confirmation_data.in_response_to == \
+           ""_59B3A01B03334032C31E434C63F89E3E""
+    assert len(kl.extension_elements) == 1
+    ee = kl.extension_elements[0]
+    assert ee.tag == ""Trustlevel""
+    assert ee.namespace == ""urn:mace:example.com:saml:assertion""
+    assert ee.text.strip() == ""Excellent""
+
+
+def test_to_fro_string_1():
+    kl = create_class_from_xml_string(SubjectConfirmation,
+                                      SUBJECT_CONFIRMATION_WITH_MEMBER_EXTENSION)
+    txt = kl.to_string()
+    cpy = create_class_from_xml_string(SubjectConfirmation, txt)
+
+    print(kl.__dict__)
+    print(cpy.__dict__)
+
+    assert kl.text.strip() == cpy.text.strip()
+    assert _eq(kl.keyswv(), cpy.keyswv())
+    assert len(kl.extension_elements) == len(cpy.extension_elements)
+    klee = kl.extension_elements[0]
+    cpyee = cpy.extension_elements[0]
+    assert klee.text.strip() == cpyee.text.strip()
+    assert klee.tag == cpyee.tag
+    assert klee.namespace == cpyee.namespace
+
+
+def test_make_vals_str():
+    kl = make_vals(""Jeter"", md.GivenName, part=True)
+    assert isinstance(kl, md.GivenName)
+    assert kl.text == ""Jeter""
+
+
+def test_make_vals_list_of_strs():
+    cp = md.ContactPerson()
+    make_vals([""Derek"", ""Sanderson""], md.GivenName, cp, ""given_name"")
+    assert len(cp.given_name) == 2
+    assert _eq([i.text for i in cp.given_name], [""Sanderson"", ""Derek""])
+
+
+def test_attribute_element_to_extension_element():
+    attr = create_class_from_xml_string(Attribute, saml2_data.TEST_ATTRIBUTE)
+    ee = saml2.element_to_extension_element(attr)
+    print(ee.__dict__)
+    assert ee.tag == ""Attribute""
+    assert ee.namespace == 'urn:oasis:names:tc:SAML:2.0:assertion'
+    assert _eq(ee.attributes.keys(), ['FriendlyName', 'Name', 'NameFormat'])
+    assert ee.attributes[""FriendlyName""] == 'test attribute'
+    assert ee.attributes[""Name""] == ""testAttribute""
+    assert ee.attributes[""NameFormat""] == \
+           'urn:oasis:names:tc:SAML:2.0:attrname-format:unspecified'
+    assert len(ee.children) == 2
+    for child in ee.children:
+        # children are also extension element instances
+        assert child.namespace == 'urn:oasis:names:tc:SAML:2.0:assertion'
+        assert child.tag == ""AttributeValue""
+
+
+def test_ee_7():
+    ee = saml2.extension_element_from_string(
+        """"""<?xml version='1.0' encoding='UTF-8'?>
+   <ExternalEntityAttributeAuthority
+       xmlns=""urn:oasis:names:tc:SAML:metadata:dynamicsaml"">
+       <AssertingEntity>
+           <NameID Format=""urn:oasis:names:tc:SAML:2.0:nameid-format:entity"">
+               http://federationX.org
+           </NameID>
+       </AssertingEntity>
+       <RetrievalEndpoint>
+           https://federationX.org/?ID=a87s76a5765da76576a57as
+       </RetrievalEndpoint>
+   </ExternalEntityAttributeAuthority>
+"""""")
+
+    print(ee.__dict__)
+    assert len(ee.children) == 2
+    for child in ee.children:
+        assert child.namespace == ""urn:oasis:names:tc:SAML:metadata:dynamicsaml""
+    assert _eq([""AssertingEntity"", ""RetrievalEndpoint""],
+               [c.tag for c in ee.children])
+    aes = [c for c in ee.children if c.tag == ""AssertingEntity""]
+    assert len(aes) == 1
+    assert len(aes[0].children) == 1
+    assert _eq(aes[0].attributes.keys(), [])
+    nid = aes[0].children[0]
+    assert nid.tag == ""NameID""
+    assert nid.namespace == ""urn:oasis:names:tc:SAML:metadata:dynamicsaml""
+    assert len(nid.children) == 0
+    assert _eq(nid.attributes.keys(), [""Format""])
+    assert nid.text.strip() == ""http://federationX.org""
+
+
+def test_ee_xxe():
+    xml = """"""<?xml version=""1.0""?>
+    <!DOCTYPE lolz [
+    <!ENTITY lol ""lol"">
+    <!ELEMENT lolz (#PCDATA)>
+    <!ENTITY lol1 ""&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;"">
+    ]>
+    <lolz>&lol1;</lolz>
+    """"""
+    with raises(EntitiesForbidden):
+        saml2.extension_element_from_string(xml)
+
+
+def test_extension_element_loadd():
+    ava = {'attributes': {},
+           'tag': 'ExternalEntityAttributeAuthority',
+           'namespace': 'urn:oasis:names:tc:SAML:metadata:dynamicsaml',
+           'children': [{
+                            ""tag"": ""AssertingEntity"",
+                            ""namespace"": ""urn:oasis:names:tc:SAML:metadata:dynamicsaml"",
+
+                            ""children"": [{
+                                             ""tag"": ""NameID"",
+                                             ""namespace"": ""urn:oasis:names:tc:SAML:metadata:dynamicsaml"",
+                                             ""text"": ""http://federationX.org"",
+                                             ""attributes"": {
+                                                 ""Format"": ""urn:oasis:names:tc:SAML:2.0:nameid-format:entity""
+                                             },
+                                         }]
+                        }, {
+                            ""tag"": ""RetrievalEndpoint"",
+                            ""namespace"": ""urn:oasis:names:tc:SAML:metadata""
+                                         "":dynamicsaml"",
+                            ""text"": ""https://federationX.org/?ID=a87s76a5765da76576a57as"",
+                        }],
+    }
+
+    ee = saml2.ExtensionElement(ava[""tag""]).loadd(ava)
+    print(ee.__dict__)
+    assert len(ee.children) == 2
+    for child in ee.children:
+        assert child.namespace == ""urn:oasis:names:tc:SAML:metadata:dynamicsaml""
+    assert _eq([""AssertingEntity"", ""RetrievalEndpoint""],
+               [c.tag for c in ee.children])
+    aes = [c for c in ee.children if c.tag == ""AssertingEntity""]
+    assert len(aes) == 1
+    assert len(aes[0].children) == 1
+    assert _eq(aes[0].attributes.keys(), [])
+    nid = aes[0].children[0]
+    assert nid.tag == ""NameID""
+    assert nid.namespace == ""urn:oasis:names:tc:SAML:metadata:dynamicsaml""
+    assert len(nid.children) == 0
+    assert _eq(nid.attributes.keys(), [""Format""])
+    assert nid.text.strip() == ""http://federationX.org""
+
+
+def test_extensions_loadd():
+    ava = {""extension_elements"": [
+        {
+            'attributes': {},
+            'tag': 'ExternalEntityAttributeAuthority',
+            'namespace': 'urn:oasis:names:tc:SAML:metadata:dynamicsaml',
+            'children': [
+                {""tag"": ""AssertingEntity"",
+                 ""namespace"": ""urn:oasis:names:tc:SAML:metadata:dynamicsaml"",
+                 ""children"": [
+                     {""tag"": ""NameID"",
+                      ""namespace"": ""urn:oasis:names:tc:SAML:metadata:dynamicsaml"",
+                      ""text"": ""http://federationX.org"",
+                      ""attributes"": {
+                          ""Format"": ""urn:oasis:names:tc:SAML:2.0:nameid-format:entity""
+                          },
+                      }]
+                },
+                {
+                    ""tag"": ""RetrievalEndpoint"",
+                    ""namespace"": ""urn:oasis:names:tc:SAML:metadata:dynamicsaml"",
+                    ""text"": ""https://federationX.org/?ID=a87s76a5765da76576a57as"",
+                }],
+            }],
+           ""extension_attributes"": {
+               ""foo"": ""bar"",
+           }
+    }
+
+    extension = saml2.SamlBase()
+    extension.loadd(ava)
+
+    print(extension.__dict__)
+    assert len(extension.extension_elements) == 1
+    ee = extension.extension_elements[0]
+    assert len(ee.children) == 2
+    for child in ee.children:
+        assert child.namespace == ""urn:oasis:names:tc:SAML:metadata:dynamicsaml""
+    assert _eq([""AssertingEntity"", ""RetrievalEndpoint""],
+               [c.tag for c in ee.children])
+    aes = [c for c in ee.children if c.tag == ""AssertingEntity""]
+    assert len(aes) == 1
+    assert len(aes[0].children) == 1
+    assert _eq(aes[0].attributes.keys(), [])
+    nid = aes[0].children[0]
+    assert nid.tag == ""NameID""
+    assert nid.namespace == ""urn:oasis:names:tc:SAML:metadata:dynamicsaml""
+    assert len(nid.children) == 0
+    assert _eq(nid.attributes.keys(), [""Format""])
+    assert nid.text.strip() == ""http://federationX.org""
+
+    assert list(extension.extension_attributes.keys()) == [""foo""]
+    assert extension.extension_attributes[""foo""] == ""bar""
+",0
+844,"def _AddUltiSnipsDataIfNeeded(extra_data):...
+
+if not USE_ULTISNIPS_DATA:
+
+return
+
+rawsnips = UltiSnips_Manager._snips('', 1)
+
+return
+
+extra_data['ultisnips_snippets'] = [{'trigger': x.trigger, 'description': x
+    .description} for x in rawsnips]
+",0
+13230,"This issue arises when a system has a small, finite pool of resources, such as database connections, threads, or memory, that cannot scale with demand. An attacker can exploit this by making numerous cheap requests that quickly consume all available resources. This leads to a denial-of-service (DoS) for legitimate users, who are unable to access the service because the resource pool is exhausted.
+
+**Vulnerable Code:**
+```python
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
+import time
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        # Simulate a long-running task that holds onto a resource (a thread).
+        time.sleep(10)
+        self.send_response(200)
+        self.end_headers()
+
+# This server has a default, limited number of threads.
+# An attacker making a few simultaneous requests can tie up all threads,
+# blocking new connections from legitimate users.
+class VulnerableServer(ThreadingMixIn, HTTPServer):
+    pass
+
+# The vulnerability isn't in the code itself, but in the configuration and architecture.
+server = VulnerableServer(('localhost', 8080), Handler)
+server.serve_forever()
+```
+
+**Secure Code:**
+```python
+from flask import Flask
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+import time
+
+# The fix is architectural: use proper configuration and rate limiting.
+app = Flask(__name__)
+
+# Implement a rate limiter to prevent any single IP from consuming too many resources.
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=[""100 per hour"", ""10 per minute""]
+)
+
+@app.route(""/slow_resource"")
+@limiter.limit(""3 per minute"") # Stricter limit for this specific resource
+def slow_resource():
+    time.sleep(1)
+    return ""Resource loaded.""
+
+# In production, this would be run behind a robust web server (like Gunicorn or uWSGI)
+# configured with an appropriate number of worker processes/threads for the expected load.
+```
+
+**Why the fix works:**
+The fix involves two parts: properly configuring the application's resource pool to handle expected traffic and implementing rate limiting. Rate limiting is critical as it prevents any single user from making an excessive number of requests, thereby preserving resources for others and mitigating DoS attacks.",0
+6305,"def VulnLogger(url, vuln):...
+
+tent = '[!] ' + url + ' -> ' + vuln
+
+VULN_LIST.append(tent)
+",0
+8187,"      return errors::InvalidArgument(
+          ""Unexpected dimensions on input group_size, got "",
+          group_size.shape().DebugString());
+      return errors::InvalidArgument(
+          ""Unexpected dimensions on input group_key, got "",
+          group_key.shape().DebugString());
+      return errors::InvalidArgument(
+                         done_with_cleanup);
+      return errors::InvalidArgument(
+      return errors::InvalidArgument(
+          ""Unexpected dimensions on input group_key, got "",
+          group_key_t.shape().DebugString());
+                         done_with_cleanup);
+                         done_with_cleanup);
+@combinations.generate(
+    combinations.times(
+        combinations.combine(collective_op=[
+            combinations.NamedObject('all_reduce_v2',
+                                     CollectiveOpsV2.all_reduce),
+            combinations.NamedObject('all_gather_v2',
+                                     CollectiveOpsV2.all_gather)
+        ]), device_combination))
+class InvalidInputTest(test.TestCase, parameterized.TestCase):
+
+  def setUp(self):
+    _setup_context()
+    super().setUp()
+
+  def testInvalidGroupKey(self, collective_op, device, communication):
+    dev0 = '/device:%s:0' % device
+    group_size = 2
+    group_key = [100]
+    instance_key = 100
+    in_tensor = constant_op.constant([1.])
+
+    with self.assertRaises(errors.InvalidArgumentError):
+      with ops.device(dev0):
+        collective_op(
+            in_tensor,
+            group_size,
+            group_key,
+            instance_key,
+            communication_hint=communication)
+
+  def testInvalidGroupSize(self, collective_op, device, communication):
+    dev0 = '/device:%s:0' % device
+    group_size = -2
+    group_key = 100
+    instance_key = 100
+    in_tensor = constant_op.constant([1.])
+
+    with self.assertRaises(errors.InvalidArgumentError):
+      with ops.device(dev0):
+        collective_op(
+            in_tensor,
+            group_size,
+            group_key,
+            instance_key,
+            communication_hint=communication)
+
+  def testInvalidInstanceKey(self, collective_op, device, communication):
+    dev0 = '/device:%s:0' % device
+    group_size = 2
+    group_key = 100
+    instance_key = [100]
+    in_tensor = constant_op.constant([1.])
+
+    with self.assertRaises(errors.InvalidArgumentError):
+      with ops.device(dev0):
+        collective_op(
+            in_tensor,
+            group_size,
+            group_key,
+            instance_key,
+            communication_hint=communication)
+
+",0
+3745,"def test__load_user_by_profile(self):...
+
+auth_id = 'test:12345'
+
+user_info = {'auth_id': auth_id, 'info': {}}
+
+p = models.UserProfile.get_or_create(auth_id, user_info)
+
+req = EngineAuthRequest.blank('/auth/google')
+
+req._load_session()
+
+req._load_user()
+
+user_count = models.User.query().count()
+
+self.assertEqual(user_count, 0)
+
+req.load_user_by_profile(p)
+
+user_count = models.User.query().count()
+
+self.assertEqual(user_count, 1)
+
+user = models.User.query().get()
+
+self.assertTrue(p.key.id() in user.auth_ids)
+
+req = EngineAuthRequest.blank('/auth/google')
+
+req._load_session()
+
+req._load_user()
+
+req.load_user_by_profile(p)
+
+user_count = models.User.query().count()
+
+self.assertEqual(user_count, 1)
+
+auth_id = 'test:abc'
+
+user_info = {'auth_id': auth_id, 'info': {}}
+
+p1 = models.UserProfile.get_or_create(auth_id, user_info)
+
+req.load_user_by_profile(p1)
+
+user_count = models.User.query().count()
+
+self.assertEqual(user_count, 1)
+",0
+1260,"@oauth_error_handler...
+
+""""""docstring""""""
+
+if not current_user.is_authenticated():
+
+return current_app.login_manager.unauthorized()
+
+account = RemoteAccount.get(user_id=current_user.get_id(), client_id=remote
+    .consumer_key)
+
+if account:
+
+account.delete()
+
+return redirect(url_for('oauthclient_settings.index'))
+",0
+12761,"**Vulnerability Explanation:**
+Logging the raw exception string can leak sensitive internal information (e.g., account balance, file paths, or stack traces) to log files that may be accessible to unauthorized users, aiding attackers in reconnaissance.
+
+**Vulnerable Code:**
+```python
+import logging
+
+class BankAccount:
+    def __init__(self, balance):
+        self.balance = balance
+
+    def withdraw(self, amount):
+        try:
+            if amount > self.balance:
+                raise ValueError(""Insufficient funds"")
+            self.balance -= amount
+        except Exception as e:
+            logging.error(str(e))  # Sensitive data may be logged
+```
+
+**Secure Code:**
+```python
+import logging
+
+class BankAccount:
+    def __init__(self, balance):
+        self.balance = balance
+
+    def withdraw(self, amount):
+        try:
+            if amount > self.balance:
+                raise ValueError(""Insufficient funds"")
+            self.balance -= amount
+        except ValueError:
+            logging.error(""Withdrawal failed: insufficient funds"")
+
+account = BankAccount(100)
+account.withdraw(200)
+```
+
+**Why the Fix Works:**
+A generic, non-sensitive message is logged instead of the exception details, preventing leakage of internal state while still alerting operators.",0
+726,"def remove_host(self, host):...
+
+if host.name in self.host_names:
+
+self.hosts.remove(host)
+
+self._hosts.remove(host.name)
+
+host.remove_group(self)
+
+self.clear_hosts_cache()
+",0
+6295,"def xray_heartbeat_batch_handler(self, unused_channel, data):...
+
+""""""docstring""""""
+
+gcs_entries = ray.gcs_utils.GcsTableEntry.GetRootAsGcsTableEntry(data, 0)
+
+heartbeat_data = gcs_entries.Entries(0)
+
+message = (ray.gcs_utils.HeartbeatBatchTableData.
+    GetRootAsHeartbeatBatchTableData(heartbeat_data, 0))
+
+for j in range(message.BatchLength()):
+
+heartbeat_message = message.Batch(j)
+
+num_resources = heartbeat_message.ResourcesAvailableLabelLength()
+
+static_resources = {}
+
+dynamic_resources = {}
+
+for i in range(num_resources):
+
+dyn = heartbeat_message.ResourcesAvailableLabel(i)
+
+client_id = ray.utils.binary_to_hex(heartbeat_message.ClientId())
+
+static = heartbeat_message.ResourcesTotalLabel(i)
+
+ip = self.local_scheduler_id_to_ip_map.get(client_id)
+
+dynamic_resources[dyn] = heartbeat_message.ResourcesAvailableCapacity(i)
+
+if ip:
+
+static_resources[static] = heartbeat_message.ResourcesTotalCapacity(i)
+
+self.load_metrics.update(ip, static_resources, dynamic_resources)
+
+logger.warning('Monitor: could not find ip for client {}'.format(client_id))
+",0
+5645,""""""" Easily traverse nested Python data structures """"""
+
+__version__ = '0.2'
+
+import re
+
+"""""" Falsey class used to flag item ""missing"" from traversal path """"""
+
+def __bool__(self):...
+
+return False
+",0
+4336,"# vim: ft=python fileencoding=utf-8 sts=4 sw=4 et:
+
+# Copyright 2016-2019 Florian Bruhin (The Compiler) <mail@qutebrowser.org>
+#
+# This file is part of qutebrowser.
+#
+# qutebrowser is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# qutebrowser is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with qutebrowser.  If not, see <http://www.gnu.org/licenses/>.
+
+""""""Wrapper over our (QtWebKit) WebView.""""""
+
+import re
+import functools
+import xml.etree.ElementTree
+
+from PyQt5.QtCore import pyqtSlot, Qt, QUrl, QPoint, QTimer, QSizeF, QSize
+from PyQt5.QtGui import QIcon
+from PyQt5.QtWebKitWidgets import QWebPage, QWebFrame
+from PyQt5.QtWebKit import QWebSettings
+from PyQt5.QtPrintSupport import QPrinter
+
+from qutebrowser.browser import browsertab, shared
+from qutebrowser.browser.webkit import (webview, tabhistory, webkitelem,
+                                        webkitsettings)
+from qutebrowser.utils import qtutils, usertypes, utils, log, debug
+from qutebrowser.qt import sip
+
+
+class WebKitAction(browsertab.AbstractAction):
+
+    """"""QtWebKit implementations related to web actions.""""""
+
+    action_class = QWebPage
+    action_base = QWebPage.WebAction
+
+    def exit_fullscreen(self):
+        raise browsertab.UnsupportedOperationError
+
+    def save_page(self):
+        """"""Save the current page.""""""
+        raise browsertab.UnsupportedOperationError
+
+    def show_source(self, pygments=False):
+        self._show_source_pygments()
+
+
+class WebKitPrinting(browsertab.AbstractPrinting):
+
+    """"""QtWebKit implementations related to printing.""""""
+
+    def check_pdf_support(self):
+        pass
+
+    def check_printer_support(self):
+        pass
+
+    def check_preview_support(self):
+        pass
+
+    def to_pdf(self, filename):
+        printer = QPrinter()
+        printer.setOutputFileName(filename)
+        self.to_printer(printer)
+
+    def to_printer(self, printer, callback=None):
+        self._widget.print(printer)
+        # Can't find out whether there was an error...
+        if callback is not None:
+            callback(True)
+
+
+class WebKitSearch(browsertab.AbstractSearch):
+
+    """"""QtWebKit implementations related to searching on the page.""""""
+
+    def __init__(self, tab, parent=None):
+        super().__init__(tab, parent)
+        self._flags = QWebPage.FindFlags(0)
+
+    def _call_cb(self, callback, found, text, flags, caller):
+        """"""Call the given callback if it's non-None.
+
+        Delays the call via a QTimer so the website is re-rendered in between.
+
+        Args:
+            callback: What to call
+            found: If the text was found
+            text: The text searched for
+            flags: The flags searched with
+            caller: Name of the caller.
+        """"""
+        found_text = 'found' if found else ""didn't find""
+        # Removing FindWrapsAroundDocument to get the same logging as with
+        # QtWebEngine
+        debug_flags = debug.qflags_key(
+            QWebPage, flags & ~QWebPage.FindWrapsAroundDocument,
+            klass=QWebPage.FindFlag)
+        if debug_flags != '0x0000':
+            flag_text = 'with flags {}'.format(debug_flags)
+        else:
+            flag_text = ''
+        log.webview.debug(' '.join([caller, found_text, text, flag_text])
+                          .strip())
+        if callback is not None:
+            QTimer.singleShot(0, functools.partial(callback, found))
+
+        self.finished.emit(found)
+
+    def clear(self):
+        if self.search_displayed:
+            self.cleared.emit()
+        self.search_displayed = False
+        # We first clear the marked text, then the highlights
+        self._widget.findText('')
+        self._widget.findText('', QWebPage.HighlightAllOccurrences)
+
+    def search(self, text, *, ignore_case=usertypes.IgnoreCase.never,
+               reverse=False, result_cb=None):
+        # Don't go to next entry on duplicate search
+        if self.text == text and self.search_displayed:
+            log.webview.debug(""Ignoring duplicate search request""
+                              "" for {}"".format(text))
+            return
+
+        # Clear old search results, this is done automatically on QtWebEngine.
+        self.clear()
+
+        self.text = text
+        self.search_displayed = True
+        self._flags = QWebPage.FindWrapsAroundDocument
+        if self._is_case_sensitive(ignore_case):
+            self._flags |= QWebPage.FindCaseSensitively
+        if reverse:
+            self._flags |= QWebPage.FindBackward
+        # We actually search *twice* - once to highlight everything, then again
+        # to get a mark so we can navigate.
+        found = self._widget.findText(text, self._flags)
+        self._widget.findText(text,
+                              self._flags | QWebPage.HighlightAllOccurrences)
+        self._call_cb(result_cb, found, text, self._flags, 'search')
+
+    def next_result(self, *, result_cb=None):
+        self.search_displayed = True
+        found = self._widget.findText(self.text, self._flags)
+        self._call_cb(result_cb, found, self.text, self._flags, 'next_result')
+
+    def prev_result(self, *, result_cb=None):
+        self.search_displayed = True
+        # The int() here makes sure we get a copy of the flags.
+        flags = QWebPage.FindFlags(int(self._flags))
+        if flags & QWebPage.FindBackward:
+            flags &= ~QWebPage.FindBackward
+        else:
+            flags |= QWebPage.FindBackward
+        found = self._widget.findText(self.text, flags)
+        self._call_cb(result_cb, found, self.text, flags, 'prev_result')
+
+
+class WebKitCaret(browsertab.AbstractCaret):
+
+    """"""QtWebKit implementations related to moving the cursor/selection.""""""
+
+    @pyqtSlot(usertypes.KeyMode)
+    def _on_mode_entered(self, mode):
+        if mode != usertypes.KeyMode.caret:
+            return
+
+        self.selection_enabled = self._widget.hasSelection()
+        self.selection_toggled.emit(self.selection_enabled)
+        settings = self._widget.settings()
+        settings.setAttribute(QWebSettings.CaretBrowsingEnabled, True)
+
+        if self._widget.isVisible():
+            # Sometimes the caret isn't immediately visible, but unfocusing
+            # and refocusing it fixes that.
+            self._widget.clearFocus()
+            self._widget.setFocus(Qt.OtherFocusReason)
+
+            # Move the caret to the first element in the viewport if there
+            # isn't any text which is already selected.
+            #
+            # Note: We can't use hasSelection() here, as that's always
+            # true in caret mode.
+            if not self.selection_enabled:
+                self._widget.page().currentFrame().evaluateJavaScript(
+                    utils.read_file('javascript/position_caret.js'))
+
+    @pyqtSlot(usertypes.KeyMode)
+    def _on_mode_left(self, _mode):
+        settings = self._widget.settings()
+        if settings.testAttribute(QWebSettings.CaretBrowsingEnabled):
+            if self.selection_enabled and self._widget.hasSelection():
+                # Remove selection if it exists
+                self._widget.triggerPageAction(QWebPage.MoveToNextChar)
+            settings.setAttribute(QWebSettings.CaretBrowsingEnabled, False)
+            self.selection_enabled = False
+
+    def move_to_next_line(self, count=1):
+        if not self.selection_enabled:
+            act = QWebPage.MoveToNextLine
+        else:
+            act = QWebPage.SelectNextLine
+        for _ in range(count):
+            self._widget.triggerPageAction(act)
+
+    def move_to_prev_line(self, count=1):
+        if not self.selection_enabled:
+            act = QWebPage.MoveToPreviousLine
+        else:
+            act = QWebPage.SelectPreviousLine
+        for _ in range(count):
+            self._widget.triggerPageAction(act)
+
+    def move_to_next_char(self, count=1):
+        if not self.selection_enabled:
+            act = QWebPage.MoveToNextChar
+        else:
+            act = QWebPage.SelectNextChar
+        for _ in range(count):
+            self._widget.triggerPageAction(act)
+
+    def move_to_prev_char(self, count=1):
+        if not self.selection_enabled:
+            act = QWebPage.MoveToPreviousChar
+        else:
+            act = QWebPage.SelectPreviousChar
+        for _ in range(count):
+            self._widget.triggerPageAction(act)
+
+    def move_to_end_of_word(self, count=1):
+        if not self.selection_enabled:
+            act = [QWebPage.MoveToNextWord]
+            if utils.is_windows:  # pragma: no cover
+                act.append(QWebPage.MoveToPreviousChar)
+        else:
+            act = [QWebPage.SelectNextWord]
+            if utils.is_windows:  # pragma: no cover
+                act.append(QWebPage.SelectPreviousChar)
+        for _ in range(count):
+            for a in act:
+                self._widget.triggerPageAction(a)
+
+    def move_to_next_word(self, count=1):
+        if not self.selection_enabled:
+            act = [QWebPage.MoveToNextWord]
+            if not utils.is_windows:  # pragma: no branch
+                act.append(QWebPage.MoveToNextChar)
+        else:
+            act = [QWebPage.SelectNextWord]
+            if not utils.is_windows:  # pragma: no branch
+                act.append(QWebPage.SelectNextChar)
+        for _ in range(count):
+            for a in act:
+                self._widget.triggerPageAction(a)
+
+    def move_to_prev_word(self, count=1):
+        if not self.selection_enabled:
+            act = QWebPage.MoveToPreviousWord
+        else:
+            act = QWebPage.SelectPreviousWord
+        for _ in range(count):
+            self._widget.triggerPageAction(act)
+
+    def move_to_start_of_line(self):
+        if not self.selection_enabled:
+            act = QWebPage.MoveToStartOfLine
+        else:
+            act = QWebPage.SelectStartOfLine
+        self._widget.triggerPageAction(act)
+
+    def move_to_end_of_line(self):
+        if not self.selection_enabled:
+            act = QWebPage.MoveToEndOfLine
+        else:
+            act = QWebPage.SelectEndOfLine
+        self._widget.triggerPageAction(act)
+
+    def move_to_start_of_next_block(self, count=1):
+        if not self.selection_enabled:
+            act = [QWebPage.MoveToNextLine,
+                   QWebPage.MoveToStartOfBlock]
+        else:
+            act = [QWebPage.SelectNextLine,
+                   QWebPage.SelectStartOfBlock]
+        for _ in range(count):
+            for a in act:
+                self._widget.triggerPageAction(a)
+
+    def move_to_start_of_prev_block(self, count=1):
+        if not self.selection_enabled:
+            act = [QWebPage.MoveToPreviousLine,
+                   QWebPage.MoveToStartOfBlock]
+        else:
+            act = [QWebPage.SelectPreviousLine,
+                   QWebPage.SelectStartOfBlock]
+        for _ in range(count):
+            for a in act:
+                self._widget.triggerPageAction(a)
+
+    def move_to_end_of_next_block(self, count=1):
+        if not self.selection_enabled:
+            act = [QWebPage.MoveToNextLine,
+                   QWebPage.MoveToEndOfBlock]
+        else:
+            act = [QWebPage.SelectNextLine,
+                   QWebPage.SelectEndOfBlock]
+        for _ in range(count):
+            for a in act:
+                self._widget.triggerPageAction(a)
+
+    def move_to_end_of_prev_block(self, count=1):
+        if not self.selection_enabled:
+            act = [QWebPage.MoveToPreviousLine, QWebPage.MoveToEndOfBlock]
+        else:
+            act = [QWebPage.SelectPreviousLine, QWebPage.SelectEndOfBlock]
+        for _ in range(count):
+            for a in act:
+                self._widget.triggerPageAction(a)
+
+    def move_to_start_of_document(self):
+        if not self.selection_enabled:
+            act = QWebPage.MoveToStartOfDocument
+        else:
+            act = QWebPage.SelectStartOfDocument
+        self._widget.triggerPageAction(act)
+
+    def move_to_end_of_document(self):
+        if not self.selection_enabled:
+            act = QWebPage.MoveToEndOfDocument
+        else:
+            act = QWebPage.SelectEndOfDocument
+        self._widget.triggerPageAction(act)
+
+    def toggle_selection(self):
+        self.selection_enabled = not self.selection_enabled
+        self.selection_toggled.emit(self.selection_enabled)
+
+    def drop_selection(self):
+        self._widget.triggerPageAction(QWebPage.MoveToNextChar)
+
+    def selection(self, callback):
+        callback(self._widget.selectedText())
+
+    def reverse_selection(self):
+        self._tab.run_js_async(""""""{
+            const sel = window.getSelection();
+            sel.setBaseAndExtent(
+                sel.extentNode, sel.extentOffset, sel.baseNode,
+                sel.baseOffset
+            );
+        }"""""")
+
+    def _follow_selected(self, *, tab=False):
+        if QWebSettings.globalSettings().testAttribute(
+                QWebSettings.JavascriptEnabled):
+            if tab:
+                self._tab.data.override_target = usertypes.ClickTarget.tab
+            self._tab.run_js_async(""""""
+                const aElm = document.activeElement;
+                if (window.getSelection().anchorNode) {
+                    window.getSelection().anchorNode.parentNode.click();
+                } else if (aElm && aElm !== document.body) {
+                    aElm.click();
+                }
+            """""")
+        else:
+            selection = self._widget.selectedHtml()
+            if not selection:
+                # Getting here may mean we crashed, but we can't do anything
+                # about that until this commit is released:
+                # https://github.com/annulen/webkit/commit/0e75f3272d149bc64899c161f150eb341a2417af
+                # TODO find a way to check if something is focused
+                self._follow_enter(tab)
+                return
+            try:
+                selected_element = xml.etree.ElementTree.fromstring(
+                    '<html>{}</html>'.format(selection)).find('a')
+            except xml.etree.ElementTree.ParseError:
+                raise browsertab.WebTabError('Could not parse selected '
+                                             'element!')
+
+            if selected_element is not None:
+                try:
+                    url = selected_element.attrib['href']
+                except KeyError:
+                    raise browsertab.WebTabError('Anchor element without '
+                                                 'href!')
+                url = self._tab.url().resolved(QUrl(url))
+                if tab:
+                    self._tab.new_tab_requested.emit(url)
+                else:
+                    self._tab.load_url(url)
+
+    def follow_selected(self, *, tab=False):
+        try:
+            self._follow_selected(tab=tab)
+        finally:
+            self.follow_selected_done.emit()
+
+
+class WebKitZoom(browsertab.AbstractZoom):
+
+    """"""QtWebKit implementations related to zooming.""""""
+
+    def _set_factor_internal(self, factor):
+        self._widget.setZoomFactor(factor)
+
+
+class WebKitScroller(browsertab.AbstractScroller):
+
+    """"""QtWebKit implementations related to scrolling.""""""
+
+    # FIXME:qtwebengine When to use the main frame, when the current one?
+
+    def pos_px(self):
+        return self._widget.page().mainFrame().scrollPosition()
+
+    def pos_perc(self):
+        return self._widget.scroll_pos
+
+    def to_point(self, point):
+        self._widget.page().mainFrame().setScrollPosition(point)
+
+    def to_anchor(self, name):
+        self._widget.page().mainFrame().scrollToAnchor(name)
+
+    def delta(self, x=0, y=0):
+        qtutils.check_overflow(x, 'int')
+        qtutils.check_overflow(y, 'int')
+        self._widget.page().mainFrame().scroll(x, y)
+
+    def delta_page(self, x=0.0, y=0.0):
+        if y.is_integer():
+            y = int(y)
+            if y == 0:
+                pass
+            elif y < 0:
+                self.page_up(count=-y)
+            elif y > 0:
+                self.page_down(count=y)
+            y = 0
+        if x == 0 and y == 0:
+            return
+        size = self._widget.page().mainFrame().geometry()
+        self.delta(x * size.width(), y * size.height())
+
+    def to_perc(self, x=None, y=None):
+        if x is None and y == 0:
+            self.top()
+        elif x is None and y == 100:
+            self.bottom()
+        else:
+            for val, orientation in [(x, Qt.Horizontal), (y, Qt.Vertical)]:
+                if val is not None:
+                    frame = self._widget.page().mainFrame()
+                    maximum = frame.scrollBarMaximum(orientation)
+                    if maximum == 0:
+                        continue
+                    pos = int(maximum * val / 100)
+                    pos = qtutils.check_overflow(pos, 'int', fatal=False)
+                    frame.setScrollBarValue(orientation, pos)
+
+    def _key_press(self, key, count=1, getter_name=None, direction=None):
+        frame = self._widget.page().mainFrame()
+        getter = None if getter_name is None else getattr(frame, getter_name)
+
+        # FIXME:qtwebengine needed?
+        # self._widget.setFocus()
+
+        for _ in range(min(count, 5000)):
+            # Abort scrolling if the minimum/maximum was reached.
+            if (getter is not None and
+                    frame.scrollBarValue(direction) == getter(direction)):
+                return
+            self._tab.fake_key_press(key)
+
+    def up(self, count=1):
+        self._key_press(Qt.Key_Up, count, 'scrollBarMinimum', Qt.Vertical)
+
+    def down(self, count=1):
+        self._key_press(Qt.Key_Down, count, 'scrollBarMaximum', Qt.Vertical)
+
+    def left(self, count=1):
+        self._key_press(Qt.Key_Left, count, 'scrollBarMinimum', Qt.Horizontal)
+
+    def right(self, count=1):
+        self._key_press(Qt.Key_Right, count, 'scrollBarMaximum', Qt.Horizontal)
+
+    def top(self):
+        self._key_press(Qt.Key_Home)
+
+    def bottom(self):
+        self._key_press(Qt.Key_End)
+
+    def page_up(self, count=1):
+        self._key_press(Qt.Key_PageUp, count, 'scrollBarMinimum', Qt.Vertical)
+
+    def page_down(self, count=1):
+        self._key_press(Qt.Key_PageDown, count, 'scrollBarMaximum',
+                        Qt.Vertical)
+
+    def at_top(self):
+        return self.pos_px().y() == 0
+
+    def at_bottom(self):
+        frame = self._widget.page().currentFrame()
+        return self.pos_px().y() >= frame.scrollBarMaximum(Qt.Vertical)
+
+
+class WebKitHistoryPrivate(browsertab.AbstractHistoryPrivate):
+
+    """"""History-related methods which are not part of the extension API.""""""
+
+    def serialize(self):
+        return qtutils.serialize(self._history)
+
+    def deserialize(self, data):
+        qtutils.deserialize(data, self._history)
+
+    def load_items(self, items):
+        if items:
+            self._tab.before_load_started.emit(items[-1].url)
+
+        stream, _data, user_data = tabhistory.serialize(items)
+        qtutils.deserialize_stream(stream, self._history)
+        for i, data in enumerate(user_data):
+            self._history.itemAt(i).setUserData(data)
+        cur_data = self._history.currentItem().userData()
+        if cur_data is not None:
+            if 'zoom' in cur_data:
+                self._tab.zoom.set_factor(cur_data['zoom'])
+            if ('scroll-pos' in cur_data and
+                    self._tab.scroller.pos_px() == QPoint(0, 0)):
+                QTimer.singleShot(0, functools.partial(
+                    self._tab.scroller.to_point, cur_data['scroll-pos']))
+
+
+class WebKitHistory(browsertab.AbstractHistory):
+
+    """"""QtWebKit implementations related to page history.""""""
+
+    def __init__(self, tab):
+        super().__init__(tab)
+        self.private_api = WebKitHistoryPrivate(tab)
+
+    def __len__(self):
+        return len(self._history)
+
+    def __iter__(self):
+        return iter(self._history.items())
+
+    def current_idx(self):
+        return self._history.currentItemIndex()
+
+    def can_go_back(self):
+        return self._history.canGoBack()
+
+    def can_go_forward(self):
+        return self._history.canGoForward()
+
+    def _item_at(self, i):
+        return self._history.itemAt(i)
+
+    def _go_to_item(self, item):
+        self._tab.before_load_started.emit(item.url())
+        self._history.goToItem(item)
+
+
+class WebKitElements(browsertab.AbstractElements):
+
+    """"""QtWebKit implemementations related to elements on the page.""""""
+
+    def find_css(self, selector, callback, error_cb, *, only_visible=False):
+        utils.unused(error_cb)
+        mainframe = self._widget.page().mainFrame()
+        if mainframe is None:
+            raise browsertab.WebTabError(""No frame focused!"")
+
+        elems = []
+        frames = webkitelem.get_child_frames(mainframe)
+        for f in frames:
+            for elem in f.findAllElements(selector):
+                elems.append(webkitelem.WebKitElement(elem, tab=self._tab))
+
+        if only_visible:
+            # pylint: disable=protected-access
+            elems = [e for e in elems if e._is_visible(mainframe)]
+            # pylint: enable=protected-access
+
+        callback(elems)
+
+    def find_id(self, elem_id, callback):
+        def find_id_cb(elems):
+            """"""Call the real callback with the found elements.""""""
+            if not elems:
+                callback(None)
+            else:
+                callback(elems[0])
+
+        # Escape non-alphanumeric characters in the selector
+        # https://www.w3.org/TR/CSS2/syndata.html#value-def-identifier
+        elem_id = re.sub(r'[^a-zA-Z0-9_-]', r'\\\g<0>', elem_id)
+        self.find_css('#' + elem_id, find_id_cb, error_cb=lambda exc: None)
+
+    def find_focused(self, callback):
+        frame = self._widget.page().currentFrame()
+        if frame is None:
+            callback(None)
+            return
+
+        elem = frame.findFirstElement('*:focus')
+        if elem.isNull():
+            callback(None)
+        else:
+            callback(webkitelem.WebKitElement(elem, tab=self._tab))
+
+    def find_at_pos(self, pos, callback):
+        assert pos.x() >= 0
+        assert pos.y() >= 0
+        frame = self._widget.page().frameAt(pos)
+        if frame is None:
+            # This happens when we click inside the webview, but not actually
+            # on the QWebPage - for example when clicking the scrollbar
+            # sometimes.
+            log.webview.debug(""Hit test at {} but frame is None!"".format(pos))
+            callback(None)
+            return
+
+        # You'd think we have to subtract frame.geometry().topLeft() from the
+        # position, but it seems QWebFrame::hitTestContent wants a position
+        # relative to the QWebView, not to the frame. This makes no sense to
+        # me, but it works this way.
+        hitresult = frame.hitTestContent(pos)
+        if hitresult.isNull():
+            # For some reason, the whole hit result can be null sometimes (e.g.
+            # on doodle menu links).
+            log.webview.debug(""Hit test result is null!"")
+            callback(None)
+            return
+
+        try:
+            elem = webkitelem.WebKitElement(hitresult.element(), tab=self._tab)
+        except webkitelem.IsNullError:
+            # For some reason, the hit result element can be a null element
+            # sometimes (e.g. when clicking the timetable fields on
+            # http://www.sbb.ch/ ).
+            log.webview.debug(""Hit test result element is null!"")
+            callback(None)
+            return
+
+        callback(elem)
+
+
+class WebKitAudio(browsertab.AbstractAudio):
+
+    """"""Dummy handling of audio status for QtWebKit.""""""
+
+    def set_muted(self, muted: bool, override: bool = False) -> None:
+        raise browsertab.WebTabError('Muting is not supported on QtWebKit!')
+
+    def is_muted(self):
+        return False
+
+    def is_recently_audible(self):
+        return False
+
+
+class WebKitTabPrivate(browsertab.AbstractTabPrivate):
+
+    """"""QtWebKit-related methods which aren't part of the public API.""""""
+
+    def networkaccessmanager(self):
+        return self._widget.page().networkAccessManager()
+
+    def user_agent(self):
+        page = self._widget.page()
+        return page.userAgentForUrl(self._tab.url())
+
+    def clear_ssl_errors(self):
+        self.networkaccessmanager().clear_all_ssl_errors()
+
+    def event_target(self):
+        return self._widget
+
+    def shutdown(self):
+        self._widget.shutdown()
+
+
+class WebKitTab(browsertab.AbstractTab):
+
+    """"""A QtWebKit tab in the browser.""""""
+
+    def __init__(self, *, win_id, mode_manager, private, parent=None):
+        super().__init__(win_id=win_id, private=private, parent=parent)
+        widget = webview.WebView(win_id=win_id, tab_id=self.tab_id,
+                                 private=private, tab=self)
+        if private:
+            self._make_private(widget)
+        self.history = WebKitHistory(tab=self)
+        self.scroller = WebKitScroller(tab=self, parent=self)
+        self.caret = WebKitCaret(mode_manager=mode_manager,
+                                 tab=self, parent=self)
+        self.zoom = WebKitZoom(tab=self, parent=self)
+        self.search = WebKitSearch(tab=self, parent=self)
+        self.printing = WebKitPrinting(tab=self)
+        self.elements = WebKitElements(tab=self)
+        self.action = WebKitAction(tab=self)
+        self.audio = WebKitAudio(tab=self, parent=self)
+        self.private_api = WebKitTabPrivate(mode_manager=mode_manager,
+                                            tab=self)
+        # We're assigning settings in _set_widget
+        self.settings = webkitsettings.WebKitSettings(settings=None)
+        self._set_widget(widget)
+        self._connect_signals()
+        self.backend = usertypes.Backend.QtWebKit
+
+    def _install_event_filter(self):
+        self._widget.installEventFilter(self._mouse_event_filter)
+
+    def _make_private(self, widget):
+        settings = widget.settings()
+        settings.setAttribute(QWebSettings.PrivateBrowsingEnabled, True)
+
+    def load_url(self, url, *, emit_before_load_started=True):
+        self._load_url_prepare(
+            url, emit_before_load_started=emit_before_load_started)
+        self._widget.load(url)
+
+    def url(self, *, requested=False):
+        frame = self._widget.page().mainFrame()
+        if requested:
+            return frame.requestedUrl()
+        else:
+            return frame.url()
+
+    def dump_async(self, callback, *, plain=False):
+        frame = self._widget.page().mainFrame()
+        if plain:
+            callback(frame.toPlainText())
+        else:
+            callback(frame.toHtml())
+
+    def run_js_async(self, code, callback=None, *, world=None):
+        if world is not None and world != usertypes.JsWorld.jseval:
+            log.webview.warning(""Ignoring world ID {}"".format(world))
+        document_element = self._widget.page().mainFrame().documentElement()
+        result = document_element.evaluateJavaScript(code)
+        if callback is not None:
+            callback(result)
+
+    def icon(self):
+        return self._widget.icon()
+
+    def reload(self, *, force=False):
+        if force:
+            action = QWebPage.ReloadAndBypassCache
+        else:
+            action = QWebPage.Reload
+        self._widget.triggerPageAction(action)
+
+    def stop(self):
+        self._widget.stop()
+
+    def title(self):
+        return self._widget.title()
+
+    @pyqtSlot()
+    def _on_history_trigger(self):
+        url = self.url()
+        requested_url = self.url(requested=True)
+        self.history_item_triggered.emit(url, requested_url, self.title())
+
+    def set_html(self, html, base_url=QUrl()):
+        self._widget.setHtml(html, base_url)
+
+    @pyqtSlot()
+    def _on_load_started(self):
+        super()._on_load_started()
+        nam = self._widget.page().networkAccessManager()
+        nam.netrc_used = False
+        # Make sure the icon is cleared when navigating to a page without one.
+        self.icon_changed.emit(QIcon())
+
+    @pyqtSlot(bool)
+    def _on_load_finished(self, ok: bool) -> None:
+        super()._on_load_finished(ok)
+        self._update_load_status(ok)
+
+    @pyqtSlot()
+    def _on_frame_load_finished(self):
+        """"""Make sure we emit an appropriate status when loading finished.
+
+        While Qt has a bool ""ok"" attribute for loadFinished, it always is True
+        when using error pages... See
+        https://github.com/qutebrowser/qutebrowser/issues/84
+        """"""
+        self._on_load_finished(not self._widget.page().error_occurred)
+
+    @pyqtSlot()
+    def _on_webkit_icon_changed(self):
+        """"""Emit iconChanged with a QIcon like QWebEngineView does.""""""
+        if sip.isdeleted(self._widget):
+            log.webview.debug(""Got _on_webkit_icon_changed for deleted view!"")
+            return
+        self.icon_changed.emit(self._widget.icon())
+
+    @pyqtSlot(QWebFrame)
+    def _on_frame_created(self, frame):
+        """"""Connect the contentsSizeChanged signal of each frame.""""""
+        # FIXME:qtwebengine those could theoretically regress:
+        # https://github.com/qutebrowser/qutebrowser/issues/152
+        # https://github.com/qutebrowser/qutebrowser/issues/263
+        frame.contentsSizeChanged.connect(self._on_contents_size_changed)
+
+    @pyqtSlot(QSize)
+    def _on_contents_size_changed(self, size):
+        self.contents_size_changed.emit(QSizeF(size))
+
+    @pyqtSlot(usertypes.NavigationRequest)
+    def _on_navigation_request(self, navigation):
+        super()._on_navigation_request(navigation)
+        if not navigation.accepted:
+            return
+
+        log.webview.debug(""target {} override {}"".format(
+            self.data.open_target, self.data.override_target))
+
+        if self.data.override_target is not None:
+            target = self.data.override_target
+            self.data.override_target = None
+        else:
+            target = self.data.open_target
+
+        if (navigation.navigation_type == navigation.Type.link_clicked and
+                target != usertypes.ClickTarget.normal):
+            tab = shared.get_tab(self.win_id, target)
+            tab.load_url(navigation.url)
+            self.data.open_target = usertypes.ClickTarget.normal
+            navigation.accepted = False
+
+        if navigation.is_main_frame:
+            self.settings.update_for_url(navigation.url)
+
+    @pyqtSlot('QNetworkReply*')
+    def _on_ssl_errors(self, reply):
+        self._insecure_hosts.add(reply.url().host())
+
+    def _connect_signals(self):
+        view = self._widget
+        page = view.page()
+        frame = page.mainFrame()
+        page.windowCloseRequested.connect(self.window_close_requested)
+        page.linkHovered.connect(self.link_hovered)
+        page.loadProgress.connect(self._on_load_progress)
+        frame.loadStarted.connect(self._on_load_started)
+        view.scroll_pos_changed.connect(self.scroller.perc_changed)
+        view.titleChanged.connect(self.title_changed)
+        view.urlChanged.connect(self._on_url_changed)
+        view.shutting_down.connect(self.shutting_down)
+        page.networkAccessManager().sslErrors.connect(self._on_ssl_errors)
+        frame.loadFinished.connect(self._on_frame_load_finished)
+        view.iconChanged.connect(self._on_webkit_icon_changed)
+        page.frameCreated.connect(self._on_frame_created)
+        frame.contentsSizeChanged.connect(self._on_contents_size_changed)
+        frame.initialLayoutCompleted.connect(self._on_history_trigger)
+        page.navigation_request.connect(self._on_navigation_request)
+",0
+12159,"The vulnerability is command injection (argument injection). An attacker could provide a URL that is actually a command-line option for `curl`, for example `-F 'file=@/etc/passwd'` to exfiltrate local files. This is because `curl` might interpret the user-provided string as one or more options rather than a single URL.
+
+Vulnerable code:
+```python
+import subprocess
+
+url = input(""Enter a URL to curl: "")
+subprocess.run(['curl', url])
+```
+
+Secure code:
+```python
+import subprocess
+
+url = input(""Enter a URL to curl: "")
+# Use '--' to indicate the end of options and that subsequent arguments are positional.
+subprocess.run(['curl', '--', url])
+```
+
+This fix works by adding `'--'` as an argument before the user-provided URL. The `'--'` tells the `curl` command to stop processing command-line options, and to treat everything that follows as a positional argument (in this case, the URL).",0
+7935,"kind: Security
+body: Explicitly bind to localhost in docs serve
+time: 2024-05-22T09:45:40.748185-04:00
+custom:
+  Author: ChenyuLInx michelleark
+  Issue: ""10209""
+        with socketserver.TCPServer((""127.0.0.1"", port), SimpleHTTPRequestHandler) as httpd:
+from http.server import SimpleHTTPRequestHandler
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from dbt.task.docs.serve import ServeTask
+
+
+@pytest.fixture
+def serve_task():
+    # Set up
+    task = ServeTask(config=MagicMock(), args=MagicMock())
+    task.config.project_target_path = "".""
+    task.args.port = 8000
+    return task
+
+
+def test_serve_bind_to_127(serve_task):
+    serve_task.args.browser = False
+    with patch(""dbt.task.docs.serve.socketserver.TCPServer"") as patched_TCPServer:
+        patched_TCPServer.return_value = MagicMock()
+        serve_task.run()
+        patched_TCPServer.assert_called_once_with((""127.0.0.1"", 8000), SimpleHTTPRequestHandler)",0
+930,"def __init__(self, *args, lineno=None, snakefile=None):...
+
+""""""docstring""""""
+
+if len(args) == 2:
+
+name, workflow = args
+
+if len(args) == 1:
+
+self.name = name
+
+other = args[0]
+
+self.workflow = workflow
+
+self.name = other.name
+
+self.docstring = None
+
+self.workflow = other.workflow
+
+self.message = None
+
+self.docstring = other.docstring
+
+self._input = InputFiles()
+
+self.message = other.message
+
+self._output = OutputFiles()
+
+self._input = InputFiles(other._input)
+
+self._params = Params()
+
+self._output = OutputFiles(other._output)
+
+self.dependencies = dict()
+
+self._params = Params(other._params)
+
+self.dynamic_output = set()
+
+self.dependencies = dict(other.dependencies)
+
+self.dynamic_input = set()
+
+self.dynamic_output = set(other.dynamic_output)
+
+self.temp_output = set()
+
+self.dynamic_input = set(other.dynamic_input)
+
+self.protected_output = set()
+
+self.temp_output = set(other.temp_output)
+
+self.touch_output = set()
+
+self.protected_output = set(other.protected_output)
+
+self.subworkflow_input = dict()
+
+self.touch_output = set(other.touch_output)
+
+self.resources = dict(_cores=1, _nodes=1)
+
+self.subworkflow_input = dict(other.subworkflow_input)
+
+self.priority = 0
+
+self.resources = other.resources
+
+self.version = None
+
+self.priority = other.priority
+
+self._log = Log()
+
+self.version = other.version
+
+self._benchmark = None
+
+self._log = other._log
+
+self.wildcard_names = set()
+
+self._benchmark = other._benchmark
+
+self.lineno = lineno
+
+self.wildcard_names = set(other.wildcard_names)
+
+self.snakefile = snakefile
+
+self.lineno = other.lineno
+
+self.run_func = None
+
+self.snakefile = other.snakefile
+
+self.shellcmd = None
+
+self.run_func = other.run_func
+
+self.norun = False
+
+self.shellcmd = other.shellcmd
+
+self.norun = other.norun
+",0
+6345,"def for_schema(self):...
+
+return u'Nested({})'.format(u', '.join(column.for_schema() for column in
+    self.nested_columns))
+",0
+9273,"                cl = 0
+        self.parser.parse_header(data)
+        self.assertEqual(self.parser.body_rcv, None)",1
+13735,"This code is vulnerable to Command Injection. The use of `shell=True` with un-sanitized user input allows an attacker to execute arbitrary commands, as the entire string is processed by the system's shell.
+
+**Vulnerable Code:**
+```python
+import subprocess
+
+user_command = input()
+subprocess.run(f""tar -czvf archive.tar.gz {user_command}"", shell=True)
+```
+
+**Secure Code:**
+```python
+import subprocess
+
+user_input = input()
+# Pass arguments as a list to avoid using the shell.
+# This prevents the user_input from being interpreted as a command.
+subprocess.run(['tar', '-czvf', 'archive.tar.gz', user_input])
+```
+
+The fix is to avoid `shell=True` and pass the command and its arguments as a list. This treats the user-supplied data as a single argument to the `tar` command, rather than as a command to be executed by the shell.",0
+2899,"def __init__(self, d):...
+
+self.update(d)
+
+self.dont_update_if_missing = []
+
+if hasattr(self, '__setup__'):
+
+self.__setup__()
+",0
+6608,"from __future__ import absolute_import
+
+from twisted.internet import reactor
+
+from twisted.internet.defer import inlineCallbacks, maybeDeferred
+
+from twisted.web.server import Site
+
+from twisted.web.util import Redirect
+
+from Tribler.Core.Utilities.network_utils import get_random_port
+
+from Tribler.Core.Utilities.utilities import http_get, is_valid_url, parse_magnetlink
+
+from Tribler.Test.test_as_server import AbstractServer
+
+from Tribler.Test.tools import trial_timeout
+
+def __init__(self, *argv, **kwargs):...
+
+super(TestMakeTorrent, self).__init__(*argv, **kwargs)
+
+self.http_server = None
+
+def setUpHttpRedirectServer(self, port, redirect_url):...
+
+self.http_server = reactor.listenTCP(port, Site(Redirect(redirect_url)))
+
+@inlineCallbacks...
+
+if self.http_server:
+
+yield maybeDeferred(self.http_server.stopListening)
+
+yield super(TestMakeTorrent, self).tearDown()
+
+def test_parse_magnetlink_lowercase(self):...
+
+""""""docstring""""""
+
+_, hashed, _ = parse_magnetlink(
+    'magnet:?xt=urn:btih:apctqfwnowubxzoidazgaj2ba6fs6juc')
+
+self.assertEqual(hashed, ""\x03Å8\x16Íu¨\x1båÈ\x182`'A\x07\x8b/&\x82"")
+
+def test_parse_magnetlink_uppercase(self):...
+
+""""""docstring""""""
+
+_, hashed, _ = parse_magnetlink(
+    'magnet:?xt=urn:btih:APCTQFWNOWUBXZOIDAZGAJ2BA6FS6JUC')
+
+self.assertEqual(hashed, ""\x03Å8\x16Íu¨\x1båÈ\x182`'A\x07\x8b/&\x82"")
+
+def test_valid_url(self):...
+
+""""""docstring""""""
+
+test_url = 'http://anno nce.torrentsmd.com:8080/announce'
+
+self.assertFalse(is_valid_url(test_url), '%s is not a valid URL' % test_url)
+
+test_url2 = 'http://announce.torrentsmd.com:8080/announce '
+
+self.assertTrue(is_valid_url(test_url2), '%s is a valid URL' % test_url2)
+
+test_url3 = 'http://localhost:1920/announce'
+
+self.assertTrue(is_valid_url(test_url3))
+
+test_url4 = 'udp://localhost:1264'
+
+self.assertTrue(is_valid_url(test_url4))
+
+@trial_timeout(5)...
+
+""""""docstring""""""
+
+def on_callback(response):...
+
+self.assertEqual(response, magnet_link)
+
+magnet_link = 'magnet:?xt=urn:btih:DC4B96CF85A85CEEDB8ADC4B96CF85A85CEEDB8A'
+
+port = get_random_port()
+
+self.setUpHttpRedirectServer(port, magnet_link)
+
+test_url = 'http://localhost:%d' % port
+
+http_deferred = http_get(test_url).addCallback(on_callback)
+
+return http_deferred
+",0
+7465,"def getUnit(self, x, y):...
+
+return self.stateMap[x][y]
+",0
+3827,"def testUrlOpenInvalidWaitDuration(self):...
+
+self._mox.ReplayAll()
+
+self.assertEqual(url_helper.UrlOpen('url', wait_duration=-1), None)
+
+self._mox.VerifyAll()
+",0
+7155,"@app.route('/discover_new_cuisines/<int:cuisine_id>')...
+
+logger.info('GET discover_new_cuisines query')
+
+if cuisine_id in cuisine_discovery_cache:
+
+insert_time, data = cuisine_discovery_cache[cuisine_id]
+
+query_res = database.discover_new_cuisines_from_cuisine(cuisine_id)
+
+if datetime.now() < insert_time + cache_persistence_time:
+
+if query_res == -1:
+
+return data
+
+return None
+
+cuisine_discovery_cache[cuisine_id] = datetime.now(), query_res
+
+return query_res
+",0
+9967,"from dataclasses import dataclass
+
+import pytz
+
+from config import get_connection
+
+def get_visit_count():...
+
+connection = get_connection()
+
+cursor = connection.cursor()
+
+cursor.execute(f'select count(*) from visitors;')
+
+rows = cursor.fetchall()
+
+connection.commit()
+
+connection.close()
+
+return rows[0][0]
+",0
+348,"from osv import fields, osv
+
+from tools.translate import _
+
+_inherit = 'product.product'
+
+def get_product_accounts(self, cr, uid, product_id, context=None):...
+
+""""""docstring""""""
+
+if context is None:
+
+context = {}
+
+product_obj = self.pool.get('product.product').browse(cr, uid, product_id,
+    context=context)
+
+stock_input_acc = (product_obj.property_stock_account_input and product_obj
+    .property_stock_account_input.id or False)
+
+if not stock_input_acc:
+
+stock_input_acc = (product_obj.categ_id.property_stock_account_input_categ and
+    product_obj.categ_id.property_stock_account_input_categ.id or False)
+
+stock_output_acc = (product_obj.property_stock_account_output and
+    product_obj.property_stock_account_output.id or False)
+
+if not stock_output_acc:
+
+stock_output_acc = (product_obj.categ_id.
+    property_stock_account_output_categ and product_obj.categ_id.
+    property_stock_account_output_categ.id or False)
+
+journal_id = (product_obj.categ_id.property_stock_journal and product_obj.
+    categ_id.property_stock_journal.id or False)
+
+account_variation = (product_obj.categ_id.property_stock_variation and
+    product_obj.categ_id.property_stock_variation.id or False)
+
+return {'stock_account_input': stock_input_acc, 'stock_account_output':
+    stock_output_acc, 'stock_journal': journal_id,
+    'property_stock_variation': account_variation}
+",0
+3713,"import cgi
+
+import os, sys
+
+form = cgi.FieldStorage()
+
+serv = form.getvalue('serv')
+
+def get_app_dir():...
+
+d = sys.path[0]
+
+d = d.split('/')[-1]
+
+return sys.path[0] if d == 'app' else os.path.dirname(sys.path[0])
+",0
+8432,"
+
+def async_run(prog, args):
+    pid = os.fork()
+    if pid:
+        os.waitpid(pid, 0)
+    else:
+        dpid = os.fork()
+        if not dpid:
+            os.system("" "".join([prog] + args))
+        os._exit(0)
+
+            npath = self.data + '/' + notifier
+            self.logger.debug(""Running %s %s"" % (npath, "" "".join(args)))
+            async_run(npath, args)",1
+3368,"@bot.event...
+
+if str(message.guild.id) != discord_bot_server:
+
+return
+
+if discord_bot_owner and str(message.author.id) not in discord_bot_owner:
+
+return
+
+prefix = ''
+
+if message.content.startswith(COMMAND_PREFIX):
+
+prefix = COMMAND_PREFIX
+
+if message.content.startswith('<@' + str(discord_id) + '>'):
+
+async def help():...
+
+prefix = '@{}#{}'.format(bot.user.name, bot.user.discriminator)
+
+return
+
+message.channel.send('Command list:\n' + '\n' +
+    '`help` - Shows this help text\n' +
+    '`whitelist` - Add user(s) to the whitelist')
+
+args = message.content.strip().split()[1:]
+
+if not args:
+
+await message.channel.send('Usage: `{} whitelist <username> [username...]`'
+    .format(prefix), delete_after=30)
+
+if args[0] == 'help':
+
+await message.delete()
+
+await help()
+
+if args[0] == 'whitelist':
+
+if len(args) < 1:
+
+await help()
+
+await whitelist(' '.join(args[1:]))
+",0
+1336,"def run(self):...
+
+""""""docstring""""""
+
+self.callback({'success': True, 'completions': comps, 'uid': self.uid,
+    'vid': self.vid})
+
+logging.error(error)
+
+logging.debug(traceback.format_exc())
+
+self.callback({'success': False, 'error': str(error), 'uid': self.uid,
+    'vid': self.vid})
+",0
+9034,"def __init__(self, from_object: str, client):...
+
+self.from_object = from_object
+
+self.client = client
+",0
+6592,"def remove_target(domain, id_, tuser=None):...
+
+tlist = targets[domain]
+
+id_ = str(id_)
+
+tuser = tuser or ''
+
+t = tuser, id_
+
+logger.info('Removing %s from targets[%s]', repr(t), domain)
+
+tlist.remove(t)
+",0
+1786,"def formfield(self, **kwargs):...
+
+from common.forms import JsonField
+
+defaults = {'form_class': JsonField}
+
+defaults.update(kwargs)
+
+return super().formfield(**defaults)
+",0
