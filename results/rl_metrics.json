@@ -1,0 +1,36 @@
+{
+  "method": "Reinforcement Learning (contextual bandit: epsilon-greedy, partial feedback, single-step)",
+  "training_protocol": {
+    "episodes": 30,
+    "epsilon_start": 1.0,
+    "epsilon_end": 0.05,
+    "feedback_type": "partial (reward observed only for the chosen action)"
+  },
+  "tabular_q_learning": {
+    "accuracy": 0.7152,
+    "precision": 0.2504,
+    "recall": 0.3482,
+    "f1": 0.2913,
+    "auc": 0.5708,
+    "n_states": 27,
+    "alpha": 0.3,
+    "threshold": 0.11
+  },
+  "dqn": {
+    "accuracy": 0.8169,
+    "precision": 0.4711,
+    "recall": 0.7261,
+    "f1": 0.5714,
+    "auc": 0.822,
+    "confusion_matrix": {
+      "tn": 2220,
+      "fp": 111,
+      "fn": 312,
+      "tp": 159
+    },
+    "early_episode_train_acc": 0.527,
+    "late_episode_train_acc": 0.8289,
+    "threshold": 0.11
+  },
+  "scope_note": "Single-step contextual bandit (gamma=0, no multi-sample episodes) -- a well-established RL formalism, not a full multi-step MDP."
+}

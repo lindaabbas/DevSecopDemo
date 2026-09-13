@@ -1,0 +1,73 @@
+name: DevSecOps Hybrid Security Scan
+
+# Matches the CI/CD trigger described in the paper (Fig. 1 / Section IV-A):
+# runs on every push and pull request touching Python files.
+on:
+  push:
+    paths:
+      - '**.py'
+  pull_request:
+    paths:
+      - '**.py'
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install torch transformers scikit-learn pandas numpy bandit --quiet
+
+      # Trained model artifacts (models/, results/) are too large for git and
+      # are not committed to the repo -- they must be published separately
+      # (e.g. as a GitHub Release asset, or in cloud storage) and downloaded
+      # here. Replace this step with whatever hosting you actually use.
+      - name: Download trained models
+        run: |
+          echo "TODO: download models/ and results/ from wherever you host them, e.g.:"
+          echo "  gh release download models-v1 --dir models/"
+          echo "  gh release download results-v1 --dir results/"
+          # Example using GitHub CLI against a release named 'models-v1':
+          # gh release download models-v1 --dir models/ --repo ${{ github.repository }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine changed Python files (pull requests only)
+        if: github.event_name == 'pull_request'
+        id: changed
+        run: |
+          git fetch origin ${{ github.base_ref }} --depth=1
+          FILES=$(git diff --name-only origin/${{ github.base_ref }} HEAD -- '*.py' | tr '\n' ' ')
+          echo "files=$FILES" >> "$GITHUB_OUTPUT"
+
+      - name: Run security scan (pull request -- changed files only)
+        if: github.event_name == 'pull_request' && steps.changed.outputs.files != ''
+        run: python scan_changed_files.py ${{ steps.changed.outputs.files }}
+        env:
+          GATE_ON: 'Hybrid Ensemble'
+          # Set to '1' while models are still being trained/validated, so the
+          # workflow reports findings without blocking merges yet.
+          REPORT_ONLY: '0'
+
+      - name: Run security scan (push -- full repository)
+        if: github.event_name == 'push'
+        run: python scan_changed_files.py
+        env:
+          GATE_ON: 'Hybrid Ensemble'
+          REPORT_ONLY: '0'
+
+      - name: Upload scan results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-scan-results
+          path: scan_results.json

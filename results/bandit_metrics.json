@@ -1,0 +1,18 @@
+{
+  "method": "Bandit (real CLI, rule-based, no training)",
+  "threshold_tuned_on_val": 0.02,
+  "accuracy": 0.838,
+  "precision": 0.5486,
+  "recall": 0.2038,
+  "f1": 0.2972,
+  "auc": 0.5854,
+  "confusion_matrix": {
+    "tn": 2252,
+    "fp": 79,
+    "fn": 375,
+    "tp": 96
+  },
+  "test_size": 2802,
+  "timestamp": "2026-09-10T16:48:29.383765",
+  "threshold": 0.05
+}

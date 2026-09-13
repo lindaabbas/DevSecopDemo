@@ -1,0 +1,21 @@
+{
+  "method": "Hybrid Ensemble (Bandit + codebert_prob + dqn_prob)",
+  "weights": {
+    "bandit": 0.2,
+    "llm": 0.75,
+    "rl": 0.05
+  },
+  "threshold": 0.1,
+  "accuracy": 0.8994,
+  "precision": 0.661,
+  "recall": 0.8238,
+  "f1": 0.7335,
+  "auc": 0.9395,
+  "confusion_matrix": {
+    "tn": 2132,
+    "fp": 199,
+    "fn": 83,
+    "tp": 388
+  },
+  "test_size": 2802
+}

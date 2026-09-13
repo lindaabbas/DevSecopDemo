@@ -1,0 +1,23 @@
+{
+  "bandit": {
+    "threshold": 0.05
+  },
+  "dqn": {
+    "threshold": 0.11
+  },
+  "qlearn": {
+    "threshold": 0.11
+  },
+  "codebert": {
+    "threshold": 0.09
+  },
+  "graphcodebert": {
+    "threshold": 0.05
+  },
+  "codegpt": {
+    "threshold": 0.24
+  },
+  "hybrid": {
+    "threshold": 0.11
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "n_samples": 46,
+  "sufficient_for_trend": true,
+  "n_batches": 9,
+  "date_range": [
+    "2012-08-03 14:22:21+00:00",
+    "2026-05-27 12:53:13+00:00"
+  ],
+  "batch_accuracy": [
+    0.5,
+    0.4,
+    0.6,
+    0.4,
+    0.4,
+    0.4,
+    0.4,
+    0.4,
+    0.4
+  ],
+  "slope_per_batch": -0.013333,
+  "p_value": 0.154642,
+  "r_squared": 0.2667,
+  "statistically_significant": false
+}
